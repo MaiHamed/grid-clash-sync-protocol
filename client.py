@@ -5,7 +5,7 @@ import random
 from protocol import (
     create_header, parse_header,
     MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP,
-    MSG_TYPE_CLAIM_REQ, MSG_TYPE_BOARD_SNAPSHOT,MSG_TYPE_LEAVE,
+    MSG_TYPE_CLAIM_REQ, MSG_TYPE_BOARD_SNAPSHOT, MSG_TYPE_LEAVE,
     unpack_grid_snapshot
 )
 
@@ -16,7 +16,7 @@ SERVER_PORT = 5005
 client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 client_socket.settimeout(0.5)
 
-seq_num = 0  # sequence no for messages
+seq_num = 0  # sequence number for messages
 
 # send join request
 join_request = create_header(MSG_TYPE_JOIN_REQ, seq_num, 0)
@@ -35,7 +35,7 @@ while True:
         continue
 
     header = parse_header(data)
-    payload = data[20:]
+    payload = data[22:]  
 
     if header['msg_type'] == MSG_TYPE_JOIN_RESP:
         player_id = struct.unpack("!B", payload)[0]
@@ -49,7 +49,7 @@ start_time = time.time()
 claimed_cells = set()
 
 while time.time() - start_time < 30:  # run for 30 seconds
-    # randomly pick a new cell that hasn't been claimed before
+    # pick a new cell that hasn't been claimed yet
     while True:
         row = random.randint(0, 19)
         col = random.randint(0, 19)
@@ -66,22 +66,32 @@ while time.time() - start_time < 30:  # run for 30 seconds
     # small random delay before next claim
     time.sleep(random.uniform(0.5, 1.5))
 
-    # check if any snapshot is received
+    # check for snapshots
     try:
-        data, addr = client_socket.recvfrom(1024)
-        header = parse_header(data)
-        payload = data[20:]
+        while True:
+            data, addr = client_socket.recvfrom(1024)
+            header = parse_header(data)
+            payload = data[22:] 
 
-        if header['msg_type'] == MSG_TYPE_BOARD_SNAPSHOT:
-            grid = unpack_grid_snapshot(payload)
-            print("[SNAPSHOT] Received BOARD_SNAPSHOT:")
-            for r in grid:
-                print(r)
-            print("...")
+            if header['msg_type'] == MSG_TYPE_BOARD_SNAPSHOT:
+                payload_len = header['length'] - 22  
+                payload = data[22:22 + payload_len]   
+
+                if len(payload) != 200:
+                    print(f"[ERROR] BOARD_SNAPSHOT payload size incorrect: {len(payload)} bytes")
+                    continue
+
+                grid = unpack_grid_snapshot(payload)
+                print("[SNAPSHOT] Received BOARD_SNAPSHOT:")
+                for r in grid:
+                    print(r)
+                print("...")
+            else:
+                print(f"[INFO] Received message type: {header['msg_type']}")
     except socket.timeout:
         continue
 
-# send leave message to server before closing
+# send LEAVE message
 leave_msg = create_header(MSG_TYPE_LEAVE, seq_num, 0)
 client_socket.sendto(leave_msg, (SERVER_IP, SERVER_PORT))
 print("[INFO] Sent LEAVE message to server")

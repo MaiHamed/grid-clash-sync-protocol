@@ -2,7 +2,7 @@ import socket
 import struct
 import time
 import select
-from protocol import create_header, parse_header, MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP, MSG_TYPE_CLAIM_REQ, MSG_TYPE_LEAVE,MSG_TYPE_BOARD_SNAPSHOT
+from protocol import create_header, pack_grid_snapshot, parse_header, MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP, MSG_TYPE_CLAIM_REQ, MSG_TYPE_LEAVE,MSG_TYPE_BOARD_SNAPSHOT
 
 # server config
 UDP_IP = "127.0.0.1"
@@ -22,6 +22,7 @@ grid_state = [[0 for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)]
 # Timing for snapshot broadcasts
 last_snapshot_time = 0
 SNAPSHOT_INTERVAL = 0.033 
+snapshot_id = 0 
 
 print(f"Server running on {UDP_IP}:{UDP_PORT}")
 
@@ -35,7 +36,7 @@ while True:
     if server_socket in readable:
         try:
             data, addr = server_socket.recvfrom(1024)
-            if len(data) < 20:
+            if len(data) < 22:
                 print(f"[ERROR] Received packet too short from {addr}")
                 continue
 
@@ -52,7 +53,7 @@ while True:
                 print(f"[JOIN] Sent JOIN_RESPONSE to player {player_id}")
 
             elif header['msg_type'] == MSG_TYPE_CLAIM_REQ:
-                payload = data[20:]
+                payload = data[22:]
                 if len(payload) < 2:
                     print(f"[ERROR] Invalid CLAIM_REQUEST from {addr}")
                     continue
@@ -84,37 +85,40 @@ while True:
 
         except Exception as e:
             print(f"[ERROR] Exception handling client: {e}")
+ 
 
-    current_time = time.time()
-    if clients and current_time - last_snapshot_time >= SNAPSHOT_INTERVAL:
-        snapshot_bytes = b"".join(bytes(row) for row in grid_state)
-        payload = snapshot_bytes
-        msg = create_header(MSG_TYPE_BOARD_SNAPSHOT, seq_num, len(payload)) + payload
+        current_time = time.time()
+        if clients and current_time - last_snapshot_time >= SNAPSHOT_INTERVAL:
+            snapshot_bytes = pack_grid_snapshot(grid_state)
+            payload_len = len(snapshot_bytes)
+            
+            # include snapshot_id in header
+            msg = create_header(MSG_TYPE_BOARD_SNAPSHOT, seq_num, payload_len, snapshot_id) + snapshot_bytes
 
-        sent_count = 0
-        print(f"[DEBUG] Preparing to send to {len(clients)} clients: {list(clients.items())}")
-        
-        disconnected_players = []
+            sent_count = 0
+            print(f"[DEBUG] Preparing to send to {len(clients)} clients: {list(clients.items())}")
+            
+            disconnected_players = []
 
-        for player_id, addr in list(clients.items()):
-            try:
-                server_socket.sendto(msg, addr)
-                sent_count += 1
-                print(f"[SNAPSHOT] Sent to player {player_id} at {addr}")
-            except (ConnectionRefusedError, OSError) as e:
-                print(f"[DISCONNECT] Player {player_id} at {addr} seems offline: {e}")
-                disconnected_players.append(player_id)
-            except Exception as e:
-                print(f"[ERROR] Failed to send snapshot to player {player_id}: {e}")
+            for player_id, addr in list(clients.items()):
+                try:
+                    server_socket.sendto(msg, addr)
+                    sent_count += 1
+                    print(f"[SNAPSHOT] Sent SnapshotID {snapshot_id} to player {player_id} at {addr}")
+                except (ConnectionRefusedError, OSError) as e:
+                    print(f"[DISCONNECT] Player {player_id} at {addr} seems offline: {e}")
+                    disconnected_players.append(player_id)
+                except Exception as e:
+                    print(f"[ERROR] Failed to send snapshot to player {player_id}: {e}")
 
-        for pid in disconnected_players:
-            clients.pop(pid, None)
+            for pid in disconnected_players:
+                clients.pop(pid, None)
 
-
-        if sent_count > 0:
-            print(f"[SNAPSHOT] Broadcasted grid to {sent_count} clients (Seq={seq_num})")
-            seq_num += 1
-        else:
-            print(f"[SNAPSHOT] No clients to send to!")
-        
-        last_snapshot_time = current_time
+            if sent_count > 0:
+                print(f"[SNAPSHOT] Broadcasted grid to {sent_count} clients (Seq={seq_num}, SnapshotID={snapshot_id})")
+                seq_num += 1
+                snapshot_id += 1  # increment for next snapshot
+            else:
+                print(f"[SNAPSHOT] No clients to send to!")
+            
+            last_snapshot_time = current_time

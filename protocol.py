@@ -12,21 +12,22 @@ MSG_TYPE_BOARD_SNAPSHOT = 3
 MSG_TYPE_GAME_OVER = 4
 MSG_TYPE_LEAVE = 5
 
-HEADER_FORMAT = "!4s B B H I Q"  # protocol_id, version, msg_type, length, seq_num, timestamp
-HEADER_SIZE = 20
+HEADER_FORMAT = "!4s B B H H I Q"  # protocol_id, version, msg_type, length, snapshot_ID, seq_num, timestamp ,
+HEADER_SIZE = 22
 
-def create_header(msg_type, seq_num, payload_len):
+def create_header(msg_type, seq_num, payload_len, snapshot_id=0):
     length = HEADER_SIZE + payload_len
     timestamp = int(time.time() * 1000)  # milliseconds since epoch
-    return struct.pack(HEADER_FORMAT, PROTOCOL_ID, VERSION, msg_type, length, seq_num, timestamp)
+    return struct.pack(HEADER_FORMAT, PROTOCOL_ID, VERSION, msg_type, length, snapshot_id, seq_num, timestamp)
 
 def parse_header(data):
-    protocol_id, version, msg_type, length, seq_num, timestamp = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
+    protocol_id, version, msg_type, length, snapshot_id, seq_num, timestamp = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
     return {
         'protocol_id': protocol_id.decode(),
         'version': version,
         'msg_type': msg_type,
         'length': length,
+        'snapshot_id': snapshot_id,
         'seq_num': seq_num,
         'timestamp': timestamp
     }
@@ -53,7 +54,7 @@ def unpack_grid_snapshot(payload, rows=20, cols=20):
     for r in range(rows):
         for c in range(0, cols, 2):
             byte = payload[i]
-            grid[r][c] = (byte >> 4) & 0x0F 
+            grid[r][c] = (byte >> 4) & 0x0F  
             grid[r][c+1] = byte & 0x0F       
             i += 1
 

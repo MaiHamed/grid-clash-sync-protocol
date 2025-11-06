@@ -10,7 +10,7 @@ from protocol import (
 )
 
 # -------------------------------
-# Configuration
+# Config
 # -------------------------------
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 5005
@@ -22,99 +22,66 @@ seq_num = 0
 player_id = None
 
 # -------------------------------
-# Join the Game
+# Join Phase
 # -------------------------------
-join_request = create_header(MSG_TYPE_JOIN_REQ, seq_num, 0)
-client_socket.sendto(join_request, (SERVER_IP, SERVER_PORT))
+join_req = create_header(MSG_TYPE_JOIN_REQ, seq_num, 0)
+client_socket.sendto(join_req, (SERVER_IP, SERVER_PORT))
 print("[JOIN] Sent JOIN_REQUEST")
 seq_num += 1
-
-time.sleep(random.uniform(0.1, 0.4))
 
 while True:
     try:
         data, addr = client_socket.recvfrom(1024)
+        header = parse_header(data)
+        if header["msg_type"] == MSG_TYPE_JOIN_RESP:
+            player_id = struct.unpack("!B", data[22:])[0]
+            print(f"[JOIN] Assigned PlayerID={player_id}")
+            break
     except socket.timeout:
         continue
 
-    header = parse_header(data)
-    payload = data[22:]
-
-    if header['msg_type'] == MSG_TYPE_JOIN_RESP:
-        player_id = struct.unpack("!B", payload)[0]
-        print(f"[JOIN] Received JOIN_RESPONSE, assigned PlayerID: {player_id}")
-        break
-    else:
-        print(f"[JOIN] Unexpected message type: {header['msg_type']}")
-
 # -------------------------------
-# Main Loop (30 seconds)
+# Main Loop
 # -------------------------------
-start_time = time.time()
-claimed_cells = set()
+start = time.time()
+claimed = set()
 
-while time.time() - start_time < 30:
-    # Pick a random cell to claim
-    while True:
-        row = random.randint(0, 19)
-        col = random.randint(0, 19)
-        if (row, col) not in claimed_cells:
-            claimed_cells.add((row, col))
-            break
+while time.time() - start < 30:
+    row, col = random.randint(0, 19), random.randint(0, 19)
+    if (row, col) in claimed:
+        continue
+    claimed.add((row, col))
 
     payload = struct.pack("!BB", row, col)
-    claim_request = create_header(MSG_TYPE_CLAIM_REQ, seq_num, len(payload)) + payload
-    client_socket.sendto(claim_request, (SERVER_IP, SERVER_PORT))
-    print(f"[CLAIM] Sent CLAIM_REQUEST for cell ({row},{col})")
+    claim_req = create_header(MSG_TYPE_CLAIM_REQ, seq_num, len(payload)) + payload
+    client_socket.sendto(claim_req, (SERVER_IP, SERVER_PORT))
+    print(f"[CLAIM] Sent CLAIM_REQUEST for ({row},{col})")
     seq_num += 1
 
-    time.sleep(random.uniform(0.5, 1.5))
-
-    # -------------------------------
-    # Listen for board snapshots
-    # -------------------------------
     try:
         while True:
             data, addr = client_socket.recvfrom(2048)
             recv_time_ms = int(time.time() * 1000)
-
             header = parse_header(data)
-            payload = data[22:]
 
-            if header['msg_type'] == MSG_TYPE_BOARD_SNAPSHOT:
-                payload_len = header['length'] - 22
-                payload = data[22:22 + payload_len]
+            if header["msg_type"] == MSG_TYPE_BOARD_SNAPSHOT:
+                snapshot_id = header.get("seq_num", 0)
+                server_ts_ms = recv_time_ms  # fallback if no server timestamp field
 
-                # Ensure valid payload size (for 20x20 grid = 400 bytes)
-                if len(payload) not in (200, 400):
-                    print(f"[ERROR] Invalid BOARD_SNAPSHOT payload size: {len(payload)} bytes")
-                    continue
-
-                # --- Numeric log line for postprocess.py ---
-                # Format: player_id snapshot_id seq_num server_ts recv_ts cpu error bw
-                server_ts_ms = recv_time_ms  # if server timestamp not embedded
-                snapshot_id = header.get("seq", 0)
+                # Log structured numeric line for postprocess.py
                 print(f"{player_id or 0} {snapshot_id} {seq_num} {server_ts_ms} {recv_time_ms} 0.0 0.0 0.0")
 
-                # --- Optional: print grid for debugging ---
-                grid = unpack_grid_snapshot(payload)
-                print("[SNAPSHOT] Received BOARD_SNAPSHOT:")
-                for r in grid:
-                    print(r)
-                print("...")
-
-            else:
-                print(f"[INFO] Received message type: {header['msg_type']}")
+                print(f"[SNAPSHOT] Player {player_id} received SnapshotID={snapshot_id}")
+                break
 
     except socket.timeout:
         continue
 
 # -------------------------------
-# Leave message and close
+# Leave Phase
 # -------------------------------
 leave_msg = create_header(MSG_TYPE_LEAVE, seq_num, 0)
 client_socket.sendto(leave_msg, (SERVER_IP, SERVER_PORT))
-print("[INFO] Sent LEAVE message to server")
-
+print("[INFO] Sent LEAVE message.")
 client_socket.close()
-print("[INFO] Client closed connection.")
+print("[INFO] Client closed.")

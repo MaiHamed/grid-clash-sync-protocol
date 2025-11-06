@@ -2,7 +2,6 @@ import socket
 import struct
 import time
 import select
-import os
 from protocol import (
     create_header, pack_grid_snapshot, parse_header,
     MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP,
@@ -14,8 +13,6 @@ from protocol import (
 # -------------------------------
 UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
-OUTDIR = "results"
-os.makedirs(OUTDIR, exist_ok=True)
 
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
@@ -30,10 +27,6 @@ grid_state = [[0 for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)]
 SNAPSHOT_INTERVAL = 0.033  # 30Hz
 last_snapshot_time = 0
 snapshot_id = 0
-
-# Numeric log file
-server_log_path = f"{OUTDIR}/server.txt"
-server_log = open(server_log_path, "w")
 
 print(f"Server running on {UDP_IP}:{UDP_PORT}")
 
@@ -92,14 +85,14 @@ while True:
         payload_len = len(snapshot_bytes)
         server_timestamp_ms = int(current_time * 1000)
 
+        # Send to all clients
         for pid, addr in list(clients.items()):
             try:
                 msg = create_header(MSG_TYPE_BOARD_SNAPSHOT, seq_num, payload_len) + snapshot_bytes
                 server_socket.sendto(msg, addr)
 
-                # Numeric log line
-                server_log.write(f"{pid} {snapshot_id} {seq_num} {server_timestamp_ms} {server_timestamp_ms} 0.0 0.0 0.0\n")
-                server_log.flush()
+                # Log clean line for postprocessing
+                print(f"{pid} {snapshot_id} {seq_num} {server_timestamp_ms} {server_timestamp_ms} 0.0 0.0 0.0")
 
                 print(f"[SNAPSHOT] Sent SnapshotID={snapshot_id} Seq={seq_num} to Player {pid}")
             except Exception as e:

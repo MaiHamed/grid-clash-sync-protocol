@@ -1,54 +1,65 @@
-# waiting_room.py
+# waiting_room.py - FIXED VERSION (no simulated players)
 import tkinter as tk
 from tkinter import ttk, messagebox
 import socket
 import struct
 import threading
 import time
+import subprocess
+import sys
 
-# You'll need to import from your protocol module
-# For now, let me define the minimal protocol functions needed
-def create_header(msg_type, seq_num, payload_len, snapshot_id=0):
-    import struct
-    import time
-    PROTOCOL_ID = b'GSSP'
-    VERSION = 1
-    HEADER_FORMAT = "!4s B B H H I Q"
-    timestamp = int(time.time() * 1000)
-    return struct.pack(HEADER_FORMAT, PROTOCOL_ID, VERSION, msg_type, 
-                      22 + payload_len, snapshot_id, seq_num, timestamp)
+# Import from your actual protocol
+try:
+    from protocol import (
+        create_header, parse_header,
+        MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP,
+        MSG_TYPE_CLAIM_REQ, MSG_TYPE_BOARD_SNAPSHOT,
+        MSG_TYPE_GAME_OVER, MSG_TYPE_LEAVE,
+        MSG_TYPE_GAME_START
+    )
+except ImportError:
+    # Fallback definitions (use your actual ones)
+    def create_header(msg_type, seq_num, payload_len, snapshot_id=0):
+        import struct
+        import time
+        PROTOCOL_ID = b'GSSP'
+        VERSION = 1
+        HEADER_FORMAT = "!4s B B H H I Q"
+        timestamp = int(time.time() * 1000)
+        return struct.pack(HEADER_FORMAT, PROTOCOL_ID, VERSION, msg_type, 
+                          22 + payload_len, snapshot_id, seq_num, timestamp)
 
-def parse_header(data):
-    import struct
-    HEADER_FORMAT = "!4s B B H H I Q"
-    HEADER_SIZE = 22
-    protocol_id, version, msg_type, length, snapshot_id, seq_num, timestamp = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
-    return {
-        'protocol_id': protocol_id.decode(),
-        'version': version,
-        'msg_type': msg_type,
-        'length': length,
-        'snapshot_id': snapshot_id,
-        'seq_num': seq_num,
-        'timestamp': timestamp
-    }
-
-# Message types
-MSG_TYPE_JOIN_REQ = 0
-MSG_TYPE_JOIN_RESP = 1
-MSG_TYPE_CLAIM_REQ = 2
-MSG_TYPE_BOARD_SNAPSHOT = 3
-MSG_TYPE_GAME_OVER = 4
-MSG_TYPE_LEAVE = 5
-MSG_TYPE_GAME_START = 6
-MSG_TYPE_WAITING_ROOM = 8
+    def parse_header(data):
+        import struct
+        HEADER_FORMAT = "!4s B B H H I Q"
+        HEADER_SIZE = 22
+        protocol_id, version, msg_type, length, snapshot_id, seq_num, timestamp = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
+        return {
+            'protocol_id': protocol_id.decode(),
+            'version': version,
+            'msg_type': msg_type,
+            'length': length,
+            'snapshot_id': snapshot_id,
+            'seq_num': seq_num,
+            'timestamp': timestamp
+        }
+    
+    # Message types
+    MSG_TYPE_JOIN_REQ = 0
+    MSG_TYPE_JOIN_RESP = 1
+    MSG_TYPE_CLAIM_REQ = 2
+    MSG_TYPE_BOARD_SNAPSHOT = 3
+    MSG_TYPE_GAME_OVER = 4
+    MSG_TYPE_LEAVE = 5
+    MSG_TYPE_GAME_START = 6
 
 class WaitingRoom:
-    def __init__(self, server_ip="127.0.0.1", server_port=5005):
+    def __init__(self, server_ip="127.0.0.1", server_port=5005, player_count=1):
         self.server_ip = server_ip
         self.server_port = server_port
+        self.player_count = player_count  # How many players to launch
         self.root = tk.Tk()
-        self.root.title("Grid Game - Waiting Room")
+        self.root.title(f"Grid Game - Waiting Room (Player {player_count})")
         self.root.geometry("500x450")
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
@@ -59,7 +70,7 @@ class WaitingRoom:
         self.receive_thread = None
         
         # Waiting room state
-        self.players = {}  # player_id: status
+        self.players = {}  # player_id: status (from server)
         self.waiting_timer = 60
         self.timer_running = False
         self.min_players = 2
@@ -105,7 +116,7 @@ class WaitingRoom:
         self.players_text = tk.Text(players_frame, height=6, width=50, 
                                    font=("Consolas", 10), bg='#f8f9fa')
         self.players_text.grid(row=0, column=0)
-        self.players_text.insert(tk.END, "No players yet...\n")
+        self.players_text.insert(tk.END, "Waiting for players...\n")
         self.players_text.config(state='disabled')
         
         # Timer
@@ -127,11 +138,18 @@ class WaitingRoom:
                                       command=self.start_game, state='disabled', width=15)
         self.start_button.grid(row=0, column=0, padx=(0, 10))
         
-        ttk.Button(button_frame, text="Leave", command=self.leave, width=15).grid(row=0, column=1)
+        # Launch more players button
+        self.more_players_btn = ttk.Button(button_frame, text="Launch More Players", 
+                                          command=self.launch_more_players, width=15)
+        self.more_players_btn.grid(row=0, column=1)
         
         # Instructions
         ttk.Label(main_frame, text="Need at least 2 players to start", 
                  foreground="gray", font=("Arial", 9)).grid(row=6, column=0, pady=(10, 0))
+        
+        # Current player count
+        ttk.Label(main_frame, text=f"Launched {self.player_count} player(s)", 
+                 foreground="blue", font=("Arial", 9)).grid(row=7, column=0, pady=(5, 0))
     
     def connect(self):
         """Connect to server"""
@@ -182,9 +200,6 @@ class WaitingRoom:
                     self.root.after(0, self.launch_game)
                     break
                 
-                # Here you would handle player list updates from server
-                # For simplicity, we'll simulate it
-                
             except socket.timeout:
                 continue
             except Exception as e:
@@ -192,32 +207,28 @@ class WaitingRoom:
                     print(f"Receive error: {e}")
     
     def update_players_display(self):
-        """Update players list"""
-        if not self.player_id:
-            return
-            
-        # Simulate other players joining (remove in final version)
-        if len(self.players) < 4:
-            # Add a simulated player
-            for pid in range(1, 5):
-                if pid not in self.players:
-                    self.players[pid] = "Ready"
-                    break
-        
-        # Update text widget
+        """Update players list - NO SIMULATION"""
+        # Update text widget with REAL players only
         self.players_text.config(state='normal')
         self.players_text.delete(1.0, tk.END)
         
-        for pid in sorted(self.players.keys()):
-            status = self.players[pid]
-            self.players_text.insert(tk.END, f"Player {pid}: {status}\n")
+        if not self.players:
+            self.players_text.insert(tk.END, "No players yet...\n")
+        else:
+            for pid in sorted(self.players.keys()):
+                status = self.players[pid]
+                self.players_text.insert(tk.END, f"Player {pid}: {status}\n")
         
         self.players_text.config(state='disabled')
         
-        # Update timer
+        # Update timer based on REAL player count
         player_count = len(self.players)
         if player_count >= self.min_players and not self.timer_running:
             self.start_countdown()
+        elif player_count < self.min_players:
+            self.timer_running = False
+            self.start_button.config(state='disabled')
+            self.timer_label.config(text=f"Need {self.min_players - player_count} more player(s)")
     
     def start_countdown(self):
         """Start countdown timer"""
@@ -236,6 +247,9 @@ class WaitingRoom:
         if player_count < self.min_players:
             self.timer_label.config(text=f"Need {self.min_players - player_count} more player(s)")
             self.progress['value'] = 0
+            self.timer_running = False
+            self.start_button.config(state='disabled')
+            return
         else:
             minutes = self.waiting_timer // 60
             seconds = self.waiting_timer % 60
@@ -261,6 +275,7 @@ class WaitingRoom:
         self.game_started = True
         self.timer_label.config(text="Starting game...")
         self.start_button.config(state='disabled')
+        self.more_players_btn.config(state='disabled')
         
         # Launch game client
         self.root.after(2000, self.launch_game)
@@ -285,6 +300,15 @@ class WaitingRoom:
         except Exception as e:
             print(f"Failed to launch game: {e}")
             messagebox.showerror("Error", f"Failed to start game: {e}")
+    
+    def launch_more_players(self):
+        """Launch additional player windows"""
+        try:
+            # Launch another waiting room
+            subprocess.Popen([sys.executable, "waiting_room.py"])
+            self.more_players_btn.config(text="Launched! (+1)")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to launch player: {e}")
     
     def leave(self):
         """Leave waiting room"""
@@ -320,5 +344,14 @@ class WaitingRoom:
 
 
 if __name__ == "__main__":
-    waiting_room = WaitingRoom()
+    # Parse command line arguments
+    import sys
+    player_count = 1
+    if len(sys.argv) > 1:
+        try:
+            player_count = int(sys.argv[1])
+        except:
+            pass
+    
+    waiting_room = WaitingRoom(player_count=player_count)
     waiting_room.run()

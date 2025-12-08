@@ -45,12 +45,14 @@ class GameServer:
         self.server_socket.bind((self.ip,self.port))
         self.running = True
         threading.Thread(target=self._server_loop, daemon=True).start()
+        print(f"[INFO] Server started at {self.ip}:{self.port}")
 
     def stop(self):
         self.running = False
         if self.server_socket: self.server_socket.close()
         self.clients.clear()
         self.waiting_room_players.clear()
+        print("[INFO] Server stopped.")
 
     # ==================== SR ARQ Sender ====================
     def _sr_send(self, player_id, msg_type, payload=b''):
@@ -71,8 +73,10 @@ class GameServer:
             self.client_timers[player_id][next_seq] = current_time_ms()
             self.client_next_seq[player_id] += 1
             self.stats['sent'] += 1
+            print(f"[SEND] to player {player_id} seq={next_seq}, type={msg_type}, window={list(window.keys())}")
         else:
             self.stats['dropped'] += 1
+            print(f"[DROPPED] to player {player_id}, window full")
 
     def _retransmit(self):
         """Check all client timers and retransmit if RTO exceeded"""
@@ -87,6 +91,7 @@ class GameServer:
                     self.server_socket.sendto(window[seq], addr)
                     timers[seq] = now
                     self.stats['sent'] += 1
+                    print(f"[RETRANSMIT] to player {pid} seq={seq}")
 
     # ==================== Server Loop ====================
     def _server_loop(self):
@@ -114,10 +119,12 @@ class GameServer:
         msg_type = header["msg_type"]
         seq = header["seq_num"]
         self.stats['received'] += 1
+        print(f"[RECEIVED] seq={seq}, type={msg_type}, from={addr}")
 
         # Send ACK for reliability
         ack_packet = create_header(MSG_TYPE_ACK, seq, 0)
         self.server_socket.sendto(ack_packet, addr)
+        print(f"[SEND ACK] seq={seq}, to={addr}")
 
         if msg_type == MSG_TYPE_JOIN_REQ:
             # Assign new player_id
@@ -125,12 +132,10 @@ class GameServer:
             while new_pid in self.waiting_room_players: new_pid += 1
             self.waiting_room_players[new_pid] = addr
             self.stats['client_count'] = len(self.waiting_room_players)
-            # Send JOIN_RESP
             payload = struct.pack("!B", new_pid)
             self._sr_send(new_pid, MSG_TYPE_JOIN_RESP, payload)
             self.seq_num += 1
 
-            # Start game if enough players
             if len(self.waiting_room_players) >= self.min_players and not self.game_active:
                 self._start_game()
 
@@ -139,14 +144,15 @@ class GameServer:
             if player_id:
                 r, c = struct.unpack("!BB", data[22:24])
                 self.grid_state[r][c] = player_id
+                print(f"[CLAIM] player {player_id} -> cell ({r},{c})")
 
         elif msg_type == MSG_TYPE_LEAVE:
             player_id = self._addr_to_pid(addr)
             if player_id:
                 self._remove_player(player_id)
+                print(f"[LEAVE] player {player_id}")
 
         elif msg_type == MSG_TYPE_ACK:
-            # Remove acknowledged packet from window
             player_id = self._addr_to_pid(addr)
             if player_id:
                 window = self.client_windows.get(player_id, {})
@@ -154,6 +160,7 @@ class GameServer:
                 if seq in window:
                     del window[seq]
                     del timers[seq]
+                    print(f"[ACK RECEIVED] from player {player_id} seq={seq}")
 
     # ==================== Helper ====================
     def _addr_to_pid(self, addr):
@@ -166,32 +173,32 @@ class GameServer:
         return None
 
     def _remove_player(self, player_id):
-        if player_id in self.clients: del self.clients[player_id]
-        if player_id in self.client_windows: del self.client_windows[player_id]
-        if player_id in self.client_timers: del self.client_timers[player_id]
-        if player_id in self.client_next_seq: del self.client_next_seq[player_id]
+        self.clients.pop(player_id, None)
+        self.client_windows.pop(player_id, None)
+        self.client_timers.pop(player_id, None)
+        self.client_next_seq.pop(player_id, None)
 
     # ==================== Snapshot ====================
     def _send_snapshot(self):
         snapshot_bytes = pack_grid_snapshot(self.grid_state)
-        # prepend snapshot_id as 4-byte integer
         payload = struct.pack("!I", self.snapshot_id) + snapshot_bytes
         for pid in self.clients.keys():
             self._sr_send(pid, MSG_TYPE_BOARD_SNAPSHOT, payload)
         self.snapshot_id += 1
+        print(f"[SNAPSHOT] id={self.snapshot_id}")
 
     # ==================== Start Game ====================
     def _start_game(self):
         self.game_active = True
-        # Move waiting players into active clients
         self.clients.update(self.waiting_room_players)
         self.waiting_room_players.clear()
-        # Notify all clients
         for pid in self.clients.keys():
             self._sr_send(pid, MSG_TYPE_GAME_START)
+        print("[GAME STARTED]")
 
     # ==================== End Game ====================
     def end_game(self):
         self.game_active = False
         for pid in self.clients.keys():
             self._sr_send(pid, MSG_TYPE_GAME_OVER)
+        print("[GAME OVER]")

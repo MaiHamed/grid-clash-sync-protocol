@@ -8,7 +8,7 @@ import threading
 import os
 from protocol import (
     create_header, pack_grid_snapshot, parse_header,
-    MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP,
+    MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP,a
     MSG_TYPE_CLAIM_REQ, MSG_TYPE_LEAVE, MSG_TYPE_BOARD_SNAPSHOT,
     MSG_TYPE_ACK, MSG_TYPE_GAME_START, MSG_TYPE_GAME_OVER
 )

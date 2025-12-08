@@ -170,80 +170,94 @@ class GameClient:
         self.auto_claim_thread = threading.Thread(target=loop, daemon=True)
         self.auto_claim_thread.start()
 
-    # ==================== Receive Loop ====================
-    def _receive_loop(self):
-        while self.running:
-            try:
-                data, addr = self.client_socket.recvfrom(2048)
-                recv_ms = current_time_ms()
-                header = parse_header(data)
-                self.stats['received'] += 1
+   # ==================== Receive Loop ====================
+def _receive_loop(self):
+    while self.running:
+        try:
+            data, addr = self.client_socket.recvfrom(2048)
+            recv_ms = current_time_ms()
+            header = parse_header(data)
+            self.stats['received'] += 1
 
-                seq = header["seq_num"]
-                msg_type = header["msg_type"]
+            seq = header["seq_num"]
+            msg_type = header["msg_type"]
 
-                # === Handle ACKs ===
-                if msg_type == MSG_TYPE_ACK:
-                    if seq in self.window:
-                        sampleRTT = recv_ms - self.send_timestamp.get(seq, recv_ms)
-                        self._update_rto(sampleRTT)
-                        del self.window[seq]
-                        del self.timers[seq]
-                        del self.send_timestamp[seq]
-                        while self.base not in self.window and self.base < self.nextSeqNum:
-                            self.base += 1
-                    continue
-
-                # Send ACK for received packet
-                ack_packet = create_header(MSG_TYPE_ACK, seq, 0)
-                self.client_socket.sendto(ack_packet, addr)
-
-                # === Original message handling ===
-                if msg_type == MSG_TYPE_JOIN_RESP and self.player_id is None:
-                    if len(data) >= 23:
-                        self.player_id = struct.unpack("!B", data[22:23])[0]
-                        self.gui.update_player_info(f"Player {self.player_id} (Waiting)", True)
-                        self.gui.log_message(f"Joined as Player {self.player_id}", "success")
-                        self.active_players.add(self.player_id)
-                        self.gui.update_players(self.active_players)
-
-                elif msg_type == MSG_TYPE_GAME_START:
-                    self.game_active = True
-                    self.waiting_for_game = False
-                    self.game_start_time = time.time()
-                    self.gui.log_message("GAME STARTED! 🎮", "success")
-                    if self.gui.auto_claim_var.get():
-                        self._start_auto_claim()
-                    self._start_game_timer()
-
-                elif msg_type == MSG_TYPE_GAME_OVER:
-                    self.game_active = False
-                    self.gui.log_message("GAME OVER! 🏁", "info")
-                    self.gui.auto_claim_var.set(False)
-
-                elif msg_type == MSG_TYPE_BOARD_SNAPSHOT and self.game_active:
-                    payload = data[22:]
-                    try:
-                        grid = unpack_grid_snapshot(payload)
-                        self.gui.update_grid(grid)
-                        new_active = set()
-                        for r in range(20):
-                            for c in range(20):
-                                pid = grid[r][c]
-                                if 1 <= pid <=4: new_active.add(pid)
-                        if new_active != self.active_players:
-                            self.active_players = new_active
-                            self.gui.update_players(self.active_players)
-                    except:
-                        pass
-                    self.gui.update_stats(self.stats)
-
-            except socket.timeout:
+            # === Handle ACKs ===
+            if msg_type == MSG_TYPE_ACK:
+                if seq in self.window:
+                    sampleRTT = recv_ms - self.send_timestamp.get(seq, recv_ms)
+                    self._update_rto(sampleRTT)
+                    del self.window[seq]
+                    del self.timers[seq]
+                    del self.send_timestamp[seq]
+                    while self.base not in self.window and self.base < self.nextSeqNum:
+                        self.base += 1
                 continue
-            except Exception as e:
-                if self.running:
-                    self.gui.log_message(f"Receive error: {e}", "error")
-                    time.sleep(0.1)
+
+            # Send ACK for received packet
+            ack_packet = create_header(MSG_TYPE_ACK, seq, 0)
+            self.client_socket.sendto(ack_packet, addr)
+
+            # === Original message handling ===
+            if msg_type == MSG_TYPE_JOIN_RESP and self.player_id is None:
+                if len(data) >= 23:
+                    self.player_id = struct.unpack("!B", data[22:23])[0]
+                    self.gui.update_player_info(f"Player {self.player_id} (Waiting)", True)
+                    self.gui.log_message(f"Joined as Player {self.player_id}", "success")
+                    self.active_players.add(self.player_id)
+                    self.gui.update_players(self.active_players)
+
+            elif msg_type == MSG_TYPE_GAME_START:
+                self.game_active = True
+                self.waiting_for_game = False
+                self.game_start_time = time.time()
+                self.gui.log_message("GAME STARTED! 🎮", "success")
+                if self.gui.auto_claim_var.get():
+                    self._start_auto_claim()
+                self._start_game_timer()
+
+            elif msg_type == MSG_TYPE_GAME_OVER:
+                self.game_active = False
+                self.gui.log_message("GAME OVER! 🏁", "info")
+                self.gui.auto_claim_var.set(False)
+
+            elif msg_type == MSG_TYPE_BOARD_SNAPSHOT and self.game_active:
+                # Extract snapshot_id (first 4 bytes of payload)
+                payload = data[22:]
+                if len(payload) < 4:
+                    continue
+                snapshot_id = struct.unpack("!I", payload[:4])[0]
+
+                # Ignore old snapshots
+                if snapshot_id <= self.last_snapshot_id:
+                    continue
+                self.last_snapshot_id = snapshot_id
+
+                # Process grid snapshot
+                try:
+                    grid_bytes = payload[4:]
+                    grid = unpack_grid_snapshot(grid_bytes)
+                    self.gui.update_grid(grid)
+                    # Update active players
+                    new_active = set()
+                    for r in range(20):
+                        for c in range(20):
+                            pid = grid[r][c]
+                            if 1 <= pid <= 4:
+                                new_active.add(pid)
+                    if new_active != self.active_players:
+                        self.active_players = new_active
+                        self.gui.update_players(self.active_players)
+                except:
+                    pass
+                self.gui.update_stats(self.stats)
+
+        except socket.timeout:
+            continue
+        except Exception as e:
+            if self.running:
+                self.gui.log_message(f"Receive error: {e}", "error")
+                time.sleep(0.1)
 
     # ==================== Game Timer ====================
     def _start_game_timer(self):

@@ -17,9 +17,14 @@ class GameServer:
         self.port = port
         
         self.server_socket = None
-        self.clients = {}  # {player_id: (addr, last_seen)}
+        self.clients = {}  
         self.seq_num = 0
         self.snapshot_id = 0
+
+        # Waiting room variables
+        self.waiting_room_players = {} 
+        self.game_active = False
+        self.min_players = 2
         
         # Grid state: 0=unclaimed, player_id=claimed
         self.grid_state = [[0 for _ in range(20)] for _ in range(20)]
@@ -131,26 +136,34 @@ class GameServer:
             self.stats['received'] += 1
             
             if msg_type == MSG_TYPE_JOIN_REQ:
+                # Check if game is already active
+                if self.game_active:
+                    self.gui.log_message("Game already active, rejecting join", "warning")
+                    return
+                
                 # Assign new player ID
                 new_player_id = 1
-                while new_player_id in self.clients:
+                while new_player_id in self.waiting_room_players:
                     new_player_id += 1
                 
-                self.clients[new_player_id] = (addr, time.time())
-                self.stats['client_count'] = len(self.clients)
+                self.waiting_room_players[new_player_id] = addr
+                self.stats['client_count'] = len(self.waiting_room_players)
                 
-                self.gui.log_message(f"Player {new_player_id} joined from {addr}", "success")
+                self.gui.log_message(f"Player {new_player_id} joined waiting room", "success")
                 
-                # Send join response with player list
-                active_players = list(self.clients.keys())
+                # Send join response
                 payload = struct.pack("!B", new_player_id)
                 resp = create_header(MSG_TYPE_JOIN_RESP, self.seq_num, len(payload)) + payload
                 self.server_socket.sendto(resp, addr)
                 self.seq_num += 1
                 self.stats['sent'] += 1
                 
+                # Check if we have enough players to start
+                if len(self.waiting_room_players) >= self.min_players and not self.game_active:
+                    self._start_game()
+                
                 # Update GUI
-                self.gui.update_players(self.clients)
+                self.gui.update_players(self.waiting_room_players)
                 self.gui.update_stats(self.stats)
             
             elif msg_type == MSG_TYPE_CLAIM_REQ:
@@ -246,6 +259,26 @@ class GameServer:
     def start_gui(self):
         """Start the GUI"""
         self.gui.run()
+
+    def _start_game(self):
+        """Start the game with waiting room players"""
+        self.game_active = True
+        self.clients = self.waiting_room_players.copy()  # Move to active players
+        self.waiting_room_players.clear()
+        
+        self.gui.log_message(f"Game started with {len(self.clients)} players!", "success")
+        self.gui.log_message("Players: " + ", ".join([f"Player {pid}" for pid in self.clients.keys()]), "info")
+        
+        # Send game start message to all clients
+        for pid, addr in self.clients.items():
+            try:
+                # You might want to add a MSG_TYPE_GAME_START message type
+                start_msg = create_header(4, self.seq_num, 0)  # Using MSG_TYPE_GAME_OVER as game start for now
+                self.server_socket.sendto(start_msg, addr)
+            except Exception as e:
+                self.gui.log_message(f"Failed to send start to player {pid}: {e}", "error")
+        
+        self.seq_num += 1
 
 
 # Main execution

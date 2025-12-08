@@ -1,14 +1,16 @@
-# client.py - Update to infer player status from grid
+# client.py - Updated with waiting room support
 import socket
 import struct
 import time
 import random
 import threading
 import tkinter as tk
+from tkinter import messagebox
 from protocol import (
     create_header, parse_header,
     MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP,
     MSG_TYPE_CLAIM_REQ, MSG_TYPE_BOARD_SNAPSHOT, MSG_TYPE_LEAVE,
+    MSG_TYPE_GAME_START, MSG_TYPE_GAME_OVER,
     unpack_grid_snapshot
 )
 
@@ -22,6 +24,12 @@ class GameClient:
         self.running = False
         self.receive_thread = None
         self.auto_claim_thread = None
+        
+        # Game state
+        self.game_active = False
+        self.waiting_for_game = True
+        self.game_start_time = None
+        self.game_duration = 60  # 60 seconds game
         
         # Statistics
         self.stats = {
@@ -44,6 +52,9 @@ class GameClient:
         
         # Track last snapshot for logging
         self.last_log_time = 0
+        
+        # Game timer
+        self.game_timer_id = None
     
     def _setup_gui_callbacks(self):
         """Setup GUI button callbacks"""
@@ -55,6 +66,10 @@ class GameClient:
         
         # Setup click handler for grid
         self.setup_click_handler()
+        
+        # Update GUI to show waiting state
+        self.gui.log_message("Waiting for game to start...", "info")
+        self.gui.update_player_info("Waiting...", True)
     
     def setup_click_handler(self):
         """Setup click handler for the GUI"""
@@ -66,12 +81,16 @@ class GameClient:
             self.gui.log_message("Not connected to server", "error")
             return
         
+        if not self.game_active:
+            self.gui.log_message("Game hasn't started yet", "warning")
+            return
+        
         # Highlight the cell temporarily
         self.gui.highlight_cell(row, col)
         
         # Send claim request
         if self._send_claim_request(row, col):
-            self.gui.log_message(f"Claiming cell ({row}, {col})...", "claim")
+            self.gui.log_message(f"Claimed cell ({row}, {col})", "success")
     
     def connect(self):
         """Connect to server"""
@@ -103,10 +122,15 @@ class GameClient:
     def disconnect(self):
         """Disconnect from server"""
         self.running = False
+        self.game_active = False
         
         # Stop auto-claim thread
         if self.auto_claim_thread and self.auto_claim_thread.is_alive():
             self.auto_claim_thread.join(timeout=1)
+        
+        # Stop game timer
+        if self.game_timer_id:
+            self.gui.root.after_cancel(self.game_timer_id)
         
         if self.client_socket:
             # Send leave message
@@ -133,6 +157,10 @@ class GameClient:
             self.gui.log_message("Not connected to server", "error")
             return False
         
+        if not self.game_active:
+            self.gui.log_message("Game hasn't started yet", "warning")
+            return False
+        
         try:
             payload = struct.pack("!BB", row, col)
             claim_req = create_header(MSG_TYPE_CLAIM_REQ, self.seq_num, len(payload)) + payload
@@ -143,8 +171,6 @@ class GameClient:
             # Add to claimed set
             self.claimed_cells.add((row, col))
             
-            self.gui.log_message(f"Claimed cell ({row}, {col})", "success")
-            
             return True
             
         except Exception as e:
@@ -154,7 +180,7 @@ class GameClient:
     def _start_auto_claim(self):
         """Start auto-claiming random cells"""
         def auto_claim_loop():
-            while self.running and self.gui.auto_claim_var.get():
+            while self.running and self.gui.auto_claim_var.get() and self.game_active:
                 try:
                     # Try to claim a random unclaimed cell
                     for _ in range(10):
@@ -190,18 +216,51 @@ class GameClient:
                 if header["msg_type"] == MSG_TYPE_JOIN_RESP and self.player_id is None:
                     if len(data) >= 23:
                         self.player_id = struct.unpack("!B", data[22:23])[0]
-                        self.gui.update_player_info(self.player_id, True)
+                        self.gui.update_player_info(f"Player {self.player_id} (Waiting)", True)
                         self.gui.log_message(f"Joined as Player {self.player_id}", "success")
+                        self.gui.log_message("Waiting for other players... Minimum 2 required.", "info")
                         
                         # Add ourselves to active players
                         if self.player_id:
                             self.active_players.add(self.player_id)
                             self.gui.update_players(self.active_players)
-                        
-                        if self.gui.auto_claim_var.get():
-                            self._start_auto_claim()
                 
-                elif header["msg_type"] == MSG_TYPE_BOARD_SNAPSHOT:
+                elif header["msg_type"] == MSG_TYPE_GAME_START:
+                    # Game is starting!
+                    self.game_active = True
+                    self.waiting_for_game = False
+                    self.game_start_time = time.time()
+                    
+                    self.gui.log_message("GAME STARTED! 🎮", "success")
+                    self.gui.log_message(f"You are Player {self.player_id}", "info")
+                    self.gui.update_player_info(f"Player {self.player_id} (Playing)", True)
+                    
+                    # Start auto-claim if enabled
+                    if self.gui.auto_claim_var.get():
+                        self._start_auto_claim()
+                    
+                    # Start game timer
+                    self._start_game_timer()
+                
+                elif header["msg_type"] == MSG_TYPE_GAME_OVER:
+                    # Game over
+                    self.game_active = False
+                    self.gui.log_message("GAME OVER! 🏁", "info")
+                    
+                    # Parse winner information if available
+                    if len(data) >= 23:
+                        winner_id = struct.unpack("!B", data[22:23])[0]
+                        if winner_id == 0:
+                            self.gui.log_message("Game ended - no winner", "info")
+                        elif winner_id == self.player_id:
+                            self.gui.log_message("🎉 YOU WIN! 🎉", "success")
+                        else:
+                            self.gui.log_message(f"Player {winner_id} wins!", "info")
+                    
+                    # Disable auto-claim
+                    self.gui.auto_claim_var.set(False)
+                
+                elif header["msg_type"] == MSG_TYPE_BOARD_SNAPSHOT and self.game_active:
                     snapshot_id = header.get("snapshot_id", 0)
                     server_ts_ms = header.get("timestamp", recv_time_ms)
                     
@@ -240,11 +299,13 @@ class GameClient:
                     self.gui.update_stats(self.stats)
                     self.gui.update_snapshot(snapshot_id)
                     
-                    # Log snapshot (once per second)
+                    # Log snapshot (once per 5 seconds)
                     current_time = time.time()
-                    if current_time - self.last_log_time >= 1.0:
+                    if current_time - self.last_log_time >= 5.0:
                         self.last_log_time = current_time
-                        self.gui.log_message(f"Snapshot {snapshot_id} (latency: {latency}ms)", "info")
+                        remaining = self.game_duration - (current_time - self.game_start_time)
+                        if remaining > 0:
+                            self.gui.log_message(f"Game time remaining: {int(remaining)}s", "info")
                 
                 # Update GUI
                 self.gui.update_stats(self.stats)
@@ -256,11 +317,40 @@ class GameClient:
                     self.gui.log_message(f"Receive error: {e}", "error")
                     time.sleep(0.1)
     
+    def _start_game_timer(self):
+        """Start the game timer display"""
+        if not self.game_active or not self.game_start_time:
+            return
+        
+        current_time = time.time()
+        elapsed = current_time - self.game_start_time
+        remaining = max(0, self.game_duration - elapsed)
+        
+        # Update timer in GUI title
+        minutes = int(remaining) // 60
+        seconds = int(remaining) % 60
+        self.gui.root.title(f"Grid Game Client - Time: {minutes:02d}:{seconds:02d}")
+        
+        # Check if game should end
+        if remaining <= 0:
+            self.game_active = False
+            self.gui.log_message("Time's up! Game ended.", "info")
+            self.gui.root.title("Grid Game Client - Game Over")
+            return
+        
+        # Schedule next update
+        self.game_timer_id = self.gui.root.after(1000, self._start_game_timer)
+    
     def _on_auto_claim_toggle(self):
         """Handle auto-claim toggle"""
         if self.gui.auto_claim_var.get():
+            if not self.game_active:
+                self.gui.log_message("Game hasn't started yet", "warning")
+                self.gui.auto_claim_var.set(False)
+                return
+            
             self.gui.log_message("Auto-claim enabled", "info")
-            if self.running and self.player_id:
+            if self.running and self.player_id and self.game_active:
                 self._start_auto_claim()
         else:
             self.gui.log_message("Auto-claim disabled", "info")

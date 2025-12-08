@@ -26,8 +26,9 @@ start_clients() {
 }
 stop_all() {
     echo "[INFO] Stopping server and clients..."
-    pkill -f "server.py" || true
-    pkill -f "client.py" || true
+    # Forcefully terminate Python processes running server.py or client.py
+    taskkill //F //IM python.exe //T >nul 2>&1 || true
+
 }
 
 apply_netem() {

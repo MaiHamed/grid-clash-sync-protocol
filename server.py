@@ -165,10 +165,14 @@ class GameServer:
                     payload = data[22:]
                     if len(payload) >= 2:
                         row, col = struct.unpack("!BB", payload[:2])
-                        if 0 <= row < 20 and 0 <= col < 20 and self.grid_state[row][col] == 0:
+                        if 0 <= row < 20 and 0 <= col < 20:
+                            old_owner = self.grid_state[row][col]
                             self.grid_state[row][col] = player_id
-                            self.gui.log_message(f"Cell ({row},{col}) claimed by Player {player_id}", "info")
                             self.gui.update_grid(self.grid_state)
+                            if old_owner == 0:
+                                self.gui.log_message(f"Player {player_id} claimed cell ({row},{col})", "info")
+                            else:
+                                self.gui.log_message(f"Player {player_id} stole cell ({row},{col}) from Player {old_owner}", "warning")
                 
                 if player_id in self.clients:
                     self.clients[player_id] = (addr, time.time())

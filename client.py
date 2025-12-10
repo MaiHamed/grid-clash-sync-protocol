@@ -310,16 +310,38 @@ class GameClient:
                 self.base += 1
 
     def _handle_data_packet(self, seq, msg_type, payload, header):
+        """
+        Handle data packet from server according to SR ARQ protocol.
+        """
+        # Send ACK for this packet immediately (as per protocol)
+        ack_packet = create_ack_packet(seq)
+        try:
+            self.client_socket.sendto(ack_packet, (self.server_ip, self.server_port))
+            print(f"[CLIENT {self.player_id}] Sent ACK for seq={seq}")
+        except Exception as e:
+            print(f"[CLIENT {self.player_id}] Failed to send ACK: {e}")
+        
+        # Store received ACK number for CLAIM_REQUESTs
+        self.last_ack_num = seq
+        
+        # Process packet based on sequence number
         if seq == self.expected_seq:
             self._process_packet(msg_type, payload, header)
             self.expected_seq += 1
+            
+            # Process any buffered packets in order
             while self.expected_seq in self.receive_buffer:
-                buffered = self.receive_buffer.pop(self.expected_seq)
-                self._process_packet(*buffered)
+                buffered_msg_type, buffered_payload, buffered_header = self.receive_buffer.pop(self.expected_seq)
+                self._process_packet(buffered_msg_type, buffered_payload, buffered_header)
                 self.expected_seq += 1
         elif seq > self.expected_seq:
+            # Buffer out-of-order packet
             self.receive_buffer[seq] = (msg_type, payload, header)
-    
+            print(f"[CLIENT {self.player_id}] Buffered out-of-order packet seq={seq}, expecting {self.expected_seq}")
+        else:
+            # Duplicate packet, ignore but still ACK it
+            print(f"[CLIENT {self.player_id}] Received duplicate packet seq={seq}")
+
     def _process_packet(self, msg_type, payload, header):
         if msg_type == MSG_TYPE_JOIN_RESP:
             self.player_id = struct.unpack("!B", payload)[0]
@@ -419,7 +441,7 @@ class GameClient:
 
     # ==================== GAME ACTIONS ====================
     def _send_claim_request(self, row, col):
-        """Send claim request using SR-ARQ (via _sr_send)"""
+        """Send claim request using SR-ARQ with proper ACK number."""
         if not self.client_socket or not self.player_id:
             self.gui.log_message("Not connected to server", "error")
             return False
@@ -428,10 +450,18 @@ class GameClient:
             return False
 
         try:
-            payload = struct.pack("!BB", row, col)
+            # Include the latest ACK number in the payload or header
+            # Based on protocol: "AckNum acknowledges the latest valid server snapshot"
+            ack_num = getattr(self, 'last_ack_num', 0)
+            
+            # Pack row, col, and ack_num
+            payload = struct.pack("!BBH", row, col, ack_num)  # 2 bytes for ack_num
+            
+            # Send using SR ARQ
             success = self._sr_send(MSG_TYPE_CLAIM_REQ, payload)
             
             if success:
+                print(f"[CLIENT {self.player_id}] Claim request for ({row},{col}) sent with ack={ack_num}")
                 return True
             else:
                 self.gui.log_message(f"Claim request for ({row},{col}) dropped (window full).", "warning")
@@ -440,7 +470,6 @@ class GameClient:
         except Exception as e:
             self.gui.log_message(f"Claim preparation error: {e}", "error")
             return False
-        
     def _start_game_timer(self):
         if not self.game_active or not self.game_start_time:
             return

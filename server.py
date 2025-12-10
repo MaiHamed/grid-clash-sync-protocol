@@ -163,12 +163,38 @@ class GameServer:
         base = self.client_base[player_id]
         window = self.client_windows[player_id]
 
+        window_size = len(window)
+    
+        print(f"[SEND DEBUG] Player {player_id}: base={base}, next_seq={next_seq}, window_size={window_size}, N={self.N}")
+        
+        # Protocol rule: "The sender may send packets while nextSeqNum < base + N"
         if next_seq >= base + self.N:
-            # Window is full, cannot send new packet
+            # Window is full according to protocol
+            print(f"[WINDOW FULL] Player {player_id}: nextSeqNum={next_seq} >= base+N={base}+{self.N}")
+            
+            # Check if we can slide window (force slide if stuck)
+            if window_size == self.N:
+                # All packets in window, check oldest timer
+                oldest_seq = min(window.keys()) if window else base
+                oldest_time = self.client_timers.get(player_id, {}).get(oldest_seq, 0)
+                
+                if current_time_ms() - oldest_time > 3 * self.RTO:
+                    # Force slide window (packet likely lost)
+                    print(f"[FORCE SLIDE] Player {player_id}: Force sliding window past seq={oldest_seq}")
+                    self.client_base[player_id] = oldest_seq + 1
+                    # Remove from window
+                    if oldest_seq in window:
+                        del window[oldest_seq]
+                    if player_id in self.client_timers and oldest_seq in self.client_timers[player_id]:
+                        del self.client_timers[player_id][oldest_seq]
+                    
+                    # Try sending again
+                    return self._sr_send(player_id, msg_type, payload)
+            
             self.stats['dropped'] += 1
             self.gui.update_stats(self.stats)
-            print(f"[WINDOW FULL] player={player_id} next={next_seq} base={base} N={self.N}")
             return False
+    
 
         # Build header
         if msg_type == MSG_TYPE_BOARD_SNAPSHOT:
@@ -341,14 +367,16 @@ class GameServer:
                         self._start_game()
 
             elif msg_type == MSG_TYPE_CLAIM_REQ:
-                # Determine player id by address lookup
                 player_id = self._addr_to_pid(addr)
 
                 if player_id:
-                    # Extract claim coordinates
-                    pay = data[HEADER_SIZE:HEADER_SIZE + 2] if len(data) >= HEADER_SIZE + 2 else b''
-                    if len(pay) >= 2:
-                        r, c = struct.unpack("!BB", pay[:2])
+                    # Extract claim coordinates and ACK number
+                    pay = data[HEADER_SIZE:HEADER_SIZE + 4] if len(data) >= HEADER_SIZE + 4 else b''
+                    if len(pay) >= 4:
+                        r, c, client_ack_num = struct.unpack("!BBH", pay[:4])
+                        
+                        # Process the ACK from client
+                        self._handle_ack(player_id, client_ack_num)
 
                         if 0 <= r < 20 and 0 <= c < 20:
 
@@ -471,33 +499,50 @@ class GameServer:
         self.gui.update_stats(self.stats)
 
     def _handle_ack(self, player_id, ack_num):
+        """
+        Handle ACK from client according to SR ARQ protocol.
+        Based on protocol: "AckNum acknowledges all correctly received messages"
+        """
         if player_id not in self.client_windows:
+            print(f"[ACK] Player {player_id} not found in client_windows")
             return
 
         window = self.client_windows[player_id]
-        timers = self.client_timers[player_id]
-        base = self.client_base[player_id]
-        next_seq = self.client_next_seq[player_id]
+        base = self.client_base.get(player_id, 0)
+        next_seq = self.client_next_seq.get(player_id, 0)
 
-        # Ignore ACK outside window
-        if ack_num < base or ack_num >= next_seq:
-            print(f"[ACK-IGNORED] PID={player_id} ack={ack_num} base={base}")
-            return
+        print(f"[ACK] Player {player_id}: ack={ack_num}, base={base}, next={next_seq}, window={list(window.keys())}")
 
-        # Remove the ACKed packet if present (out-of-order allowed)
-        if ack_num in window:
-            del window[ack_num]
-            if ack_num in timers:
-                del timers[ack_num]
-
-        # Slide base forward while next base is already ACKed
-        while base not in window and base < next_seq:
-            base += 1
-
-        self.client_base[player_id] = base
-
-        print(f"[ACK] PID={player_id} ack={ack_num} → new_base={base}, window={list(window.keys())}")
-
+        # According to protocol: "The window advances only when the base packet is acknowledged"
+        # This suggests cumulative ACKs, not selective ACKs
+        
+        # Check if this ACK acknowledges our base packet
+        if ack_num >= base:
+            # Remove all packets up to and including ack_num
+            packets_to_remove = [seq for seq in list(window.keys()) if seq <= ack_num]
+            
+            for seq in packets_to_remove:
+                if seq in window:
+                    del window[seq]
+                if player_id in self.client_timers and seq in self.client_timers[player_id]:
+                    del self.client_timers[player_id][seq]
+            
+            if packets_to_remove:
+                print(f"[ACK] Player {player_id}: Removed packets {packets_to_remove}")
+            
+            # Slide window base forward
+            new_base = ack_num + 1
+            
+            # Continue sliding if consecutive packets are already ACKed
+            while new_base not in window and new_base < next_seq:
+                new_base += 1
+            
+            if new_base != base:
+                self.client_base[player_id] = new_base
+                print(f"[ACK] Player {player_id}: Window slid base={base} -> {new_base}")
+        else:
+            # ACK for old packet, ignore
+            print(f"[ACK] Player {player_id}: Ignoring old ACK {ack_num} (current base={base})")
 
     # ==================== Snapshot ====================
     def _send_snapshot(self):
@@ -558,8 +603,18 @@ class GameServer:
     
     def _start_game(self):
         self.game_active = True
-        self._should_send_snapshots= True
+        self._should_send_snapshots = True
         self.game_start_time = time.time()  # Track when game started
+        
+        # TEMPORARY FIX: Clear windows for fresh start
+        print("[GAME START] Clearing windows for fresh start...")
+        for pid in list(self.clients.keys()):
+            self.client_windows[pid] = {}
+            self.client_timers[pid] = {}
+            self.client_next_seq[pid] = 0
+            self.client_base[pid] = 0
+            print(f"  Player {pid}: Window cleared")
+        
         # Convert waiting_room_players (pid->addr) to clients structure (pid->(addr, last_seen))
         for pid, addr in self.waiting_room_players.items():
             self.clients[pid] = (addr, time.time())
@@ -698,7 +753,6 @@ class GameServer:
             # Update GUI to show empty grid
             self.gui.update_grid(self.grid_state)
             self._end_game_with_scores()
-
 
     # ==================== GUI Integration ====================
     def _setup_gui_callbacks(self):

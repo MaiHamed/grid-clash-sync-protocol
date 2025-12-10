@@ -62,3 +62,32 @@ class LeaderboardGUI:
         self.window.destroy()
         if self.play_again_callback:
             self.play_again_callback()
+
+def play_again():
+    print("Play again clicked!")
+
+def main():
+    # Create main window
+    root = tk.Tk()
+    root.title("Test Window")
+    root.geometry("300x200")
+    
+    # Sample scores for testing
+    test_scores = [
+        (1, 42),
+        (2, 35),
+        (3, 28),
+        (4, 15),
+    ]
+    
+    # Button to show leaderboard
+    def show_leaderboard():
+        LeaderboardGUI(root, test_scores, play_again_callback=play_again)
+    
+    btn = ttk.Button(root, text="Show Leaderboard", command=show_leaderboard)
+    btn.pack(expand=True)
+    
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()

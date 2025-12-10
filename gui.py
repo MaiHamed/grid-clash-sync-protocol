@@ -2,13 +2,12 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext
 import queue
 import time
-
-from leaderboard import LeaderboardGUI
+from leaderboard import LeaderboardGUI  
 from protocol import MSG_TYPE_JOIN_REQ
 
 
 def calculate_scores_from_grid(grid):
-    
+    """Calculate player scores from the grid state"""
     scores = {}
     for row in grid:
         for cell in row:
@@ -16,6 +15,8 @@ def calculate_scores_from_grid(grid):
                 scores[cell] = scores.get(cell, 0) + 1
     # Convert to list of tuples and sort by score (highest first)
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
 class GameGUI:
     def __init__(self, title="Grid Game", rows=20, cols=20, cell_size=25):
         self.root = tk.Tk()
@@ -25,6 +26,10 @@ class GameGUI:
         self.rows = rows
         self.cols = cols
         self.cell_size = cell_size
+        
+        # Game state
+        self.game_active = True
+        self._game_over_handled = False
         
         # Data from network
         self.grid_state = [[0 for _ in range(cols)] for _ in range(rows)]
@@ -43,6 +48,9 @@ class GameGUI:
         
         # Click handler callback (set by client)
         self.cell_click_handler = None
+        
+        # Restart callback (to be set by main client)
+        self.restart_callback = None
         
         # Initialize UI widgets to None first
         self.progress = None
@@ -644,25 +652,117 @@ class GameGUI:
             self.root.quit()
             self.root.destroy()
 
-    def _end_game(self):
-        """Handle game over, show leaderboard and allow restart"""
-        # 1. Compute final scores
-        final_scores = calculate_scores_from_grid(self.grid_state)
+    def check_game_end_condition(self):
+            """Check if game should end (e.g., all cells claimed)"""
+            if not self.game_active or self._game_over_handled:
+                return False
+                
+            total_cells = self.rows * self.cols
+            claimed_cells = sum(1 for row in self.grid_state for cell in row if 1 <= cell <= 4)
+            
+            # Example condition: game ends when 95% of cells are claimed
+            if claimed_cells >= total_cells * 0.95:
+                self.end_game()
+                return True
+            return False
 
-        # 2. Log the final scores
-        self.log_message(f"Game Over! Final Scores: {final_scores}", "success")
+    def end_game(self):
+            if self._game_over_handled:
+                return
+                
+            self._game_over_handled = True
+            self.game_active = False
+            
+            # 1. Compute final scores
+            final_scores = calculate_scores_from_grid(self.grid_state)
 
-        # 3. Show leaderboard and provide restart callback
-        LeaderboardGUI(self.root, final_scores, play_again_callback=self.restart_game)
+            # 2. Log the final scores
+            self.log_message("🎮 Game Over! 🎮", "success")
+            self.log_message(f"Final Scores: {final_scores}", "info")
+            
+            # 3. Disable cell clicking during leaderboard display
+            original_handler = self.cell_click_handler
+            self.cell_click_handler = None
+            
+            # 4. Show leaderboard and provide restart callback
+            leaderboard = LeaderboardGUI(
+                self.root, 
+                final_scores, 
+                play_again_callback=lambda: self.restart_game(original_handler)
+            )
+            
+            # 5. Bring leaderboard to front
+            leaderboard.window.lift()
+            leaderboard.window.focus_force()
 
-    def restart_game(self):
-        self._game_over_handled = False
-        self.game_active = False
-        self.waiting_for_game = True
-        self.local_grid = [[0]*20 for _ in range(20)]
-        self.claimed_cells.clear()
-        self.gui.update_grid(self.local_grid)
-        self.gui.log_message("Ready for new game...", "info")
+    def restart_game(self, original_click_handler=None):
+            """Restart the game"""
+            self._game_over_handled = False
+            self.game_active = True
+            
+            # Reset grid
+            self.grid_state = [[0 for _ in range(self.cols)] for _ in range(self.rows)]
+            self.local_grid = [[0 for _ in range(self.cols)] for _ in range(self.rows)]
+            self.claimed_cells.clear()
+            
+            # Restore click handler if provided
+            if original_click_handler:
+                self.cell_click_handler = original_click_handler
+            
+            # Update GUI
+            self.draw_grid()
+            self.log_message("New game started! Click cells to claim them.", "success")
+            
+            # Call external restart callback if set
+            if self.restart_callback:
+                self.restart_callback()
+        
+    def set_restart_callback(self, callback):
+        self.restart_callback = callback
+        
+        # [Add this method to periodically check game end condition]
+    
+    def process_queue(self):
+        try:
+            while True:
+                item = self.message_queue.get_nowait()
+                msg_type = item[0]
+                
+                if msg_type == "log":
+                    _, message, level = item
+                    self._add_log_message(message, level)
+                
+                elif msg_type == "grid":
+                    _, grid_data = item
+                    self._update_grid_display(grid_data)
+                    # Check if game should end after grid update
+                    if self.game_active:
+                        self.check_game_end_condition()
+                
+                elif msg_type == "stats":
+                    _, stats = item
+                    self._update_stats_display(stats)
+                
+                elif msg_type == "players":
+                    _, players = item
+                    self._update_players_display(players)
+                
+                elif msg_type == "player_info":
+                    _, player_id, connected = item
+                    self._update_player_info_display(player_id, connected)
+                
+                elif msg_type == "snapshot":
+                    _, snapshot_id = item
+                    self._update_snapshot_display(snapshot_id)
+                
+                elif msg_type == "highlight":
+                    _, row, col = item
+                    self._highlight_cell_display(row, col)
+                
+        except queue.Empty:
+            pass
+        
+        self.root.after(100, self.process_queue)
 
 if __name__ == "__main__":
     app = GameGUI()

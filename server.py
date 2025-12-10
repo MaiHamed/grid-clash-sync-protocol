@@ -5,15 +5,24 @@ import select
 import threading
 from gui import GameGUI
 from protocol import (
-    create_ack_packet, create_header, pack_grid_snapshot, parse_header,
+    MSG_TYPE_LEADERBOARD, create_ack_packet, create_header, pack_grid_snapshot, pack_leaderboard_data, parse_header,
     MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP,
     MSG_TYPE_CLAIM_REQ, MSG_TYPE_LEAVE, MSG_TYPE_BOARD_SNAPSHOT,
-    MSG_TYPE_ACK, MSG_TYPE_GAME_START, MSG_TYPE_GAME_OVER, HEADER_SIZE
+    MSG_TYPE_ACK, MSG_TYPE_GAME_START, MSG_TYPE_GAME_OVER, HEADER_SIZE,
 )
 
 
 def current_time_ms():
     return int(time.time() * 1000)
+
+def calculate_scores_from_grid(grid):
+    scores = {}
+    for row in grid:
+        for cell in row:
+            if cell != 0:  # 0 means unclaimed
+                scores[cell] = scores.get(cell, 0) + 1
+    # Convert to list of tuples and sort by score (highest first)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
 class GameServer:
@@ -40,7 +49,15 @@ class GameServer:
         self.min_players = 2
         self.running = False
         self.grid_changed = False
-        self._should_send_snapshots = False  # NEW: Control flag for snapshots
+        self._should_send_snapshots = False  # Control flag for snapshots
+        self.game_duration = 60  # 60 seconds game duration
+        self.game_start_time = None
+
+        # leaderboard data storage
+        self.final_scores = []
+
+        # Start game timer thread
+        threading.Thread(target=self._game_timer_thread, daemon=True).start()
 
         # Statistics
         self.stats = {'sent': 0, 'received': 0, 'dropped': 0, 'client_count': 0}
@@ -514,8 +531,25 @@ class GameServer:
             print(f"[ERROR] snapshot: {e}")
 
     # ==================== Start / End Game ====================
+    
+    def _game_timer_thread(self):
+        """Background thread to manage game duration"""
+        while self.running:
+            if self.game_active and self.game_start_time:
+                elapsed = time.time() - self.game_start_time
+                if elapsed >= self.game_duration:
+                    self._end_game_with_scores()
+                    self.game_start_time = None
+                elif self.game_duration - elapsed <= 10:
+                    # Send warning when 10 seconds remaining
+                    if int(self.game_duration - elapsed) == 10:
+                        self.gui.log_message("10 seconds remaining!", "warning")
+            time.sleep(1)
+    
     def _start_game(self):
         self.game_active = True
+        self._should_send_snapshots= True
+        self.game_start_time = time.time()  # Track when game started
         # Convert waiting_room_players (pid->addr) to clients structure (pid->(addr, last_seen))
         for pid, addr in self.waiting_room_players.items():
             self.clients[pid] = (addr, time.time())
@@ -523,7 +557,7 @@ class GameServer:
 
         # Update stats & GUI
         self.stats['client_count'] = len(self.clients)
-        self.gui.log_message(f"Game started with {len(self.clients)} players!", "success")
+        self.gui.log_message(f"Game started with {len(self.clients)} players! (Duration: {self.game_duration}s)", "success")
         self.gui.log_message("Players: " + ", ".join([f"Player {pid}" for pid in self.clients.keys()]), "info")
         self.gui.update_players(self.clients)
         self.gui.update_stats(self.stats)
@@ -536,34 +570,125 @@ class GameServer:
                 self.gui.log_message(f"Failed to send start to player {pid}: {e}", "error")
         print("[GAME STARTED]")
 
-        # --- NEW: send an initial snapshot immediately so clients learn about active players/grid ---
+        # Send an initial snapshot
         try:
             self._send_snapshot()
         except Exception as e:
             self.gui.log_message(f"Failed to send initial snapshot after game start: {e}", "error")
-
-
-    def end_game(self):
+    
+    def _end_game_with_scores(self):
+        if not self.game_active:
+            return
+            
         self.game_active = False
-        self._should_send_snapshots = False  #Disable snapshots when game ends
-
-        # Send game over message to all clients
+        self._should_send_snapshots = False
+        
+        # Calculate final scores
+        self.final_scores = calculate_scores_from_grid(self.grid_state)
+        
+        # Log scores on server
+        score_str = ", ".join([f"Player {pid}: {score}" for pid, score in self.final_scores])
+        self.gui.log_message(f"Game Over! Final scores: {score_str}", "info")
+        
+        # Create leaderboard payload
+        leaderboard_payload = pack_leaderboard_data(self.final_scores)
+        
+        # Send game over message to all clients FIRST
         for pid in list(self.clients.keys()):
             try:
+                print(f"[SERVER] Sending GAME_OVER to Player {pid}")
                 self._sr_send(pid, MSG_TYPE_GAME_OVER, b'')
             except Exception as e:
                 self.gui.log_message(f"Failed to send game over to player {pid}: {e}", "error")
         
-        # Clear game state
-        self.grid_state = [[0] * 20 for _ in range(20)]
-        self.grid_claim_time = [[0] * 20 for _ in range(20)]
-        self.grid_changed = False
+        # Send leaderboard data after a SHORTER delay
+        time.sleep(0.1)  # Reduced from 0.5 to 0.1 seconds
         
-        print("[GAME OVER]")
-        self.gui.log_message("Game over", "info")
+        # Send leaderboard to all clients
+        sent_count = 0
+        for pid in list(self.clients.keys()):
+            try:
+                print(f"[SERVER] Sending LEADERBOARD to Player {pid}")
+                # Send leaderboard data
+                success = self._sr_send(pid, MSG_TYPE_LEADERBOARD, leaderboard_payload)
+                if success:
+                    sent_count += 1
+                    self.gui.log_message(f"Leaderboard sent to Player {pid}", "info")
+            except Exception as e:
+                self.gui.log_message(f"Failed to send leaderboard to player {pid}: {e}", "error")
         
-        # Update GUI to show empty grid
-        self.gui.update_grid(self.grid_state)
+        print(f"[SERVER] GAME OVER] Scores sent to {sent_count} client(s)")
+        
+        # Show leaderboard on server GUI too
+        self._show_server_leaderboard()
+
+    def _show_server_leaderboard(self):
+        """Show leaderboard on server GUI"""
+        try:
+            # This assumes your server GUI has access to show leaderboard
+            if hasattr(self.gui, 'root'):
+                # Import LeaderboardGUI here to avoid circular imports
+                from leaderboard import LeaderboardGUI
+                
+                # Create leaderboard on main thread
+                def show_lb():
+                    LeaderboardGUI(
+                        self.gui.root,
+                        self.final_scores,
+                        play_again_callback=self._restart_game
+                    )
+                
+                self.gui.root.after(0, show_lb)
+        except Exception as e:
+            print(f"[ERROR] Could not show server leaderboard: {e}")
+
+    def _restart_game(self):
+            """Restart the game after leaderboard"""
+            # Reset game state
+            self.grid_state = [[0] * 20 for _ in range(20)]
+            self.grid_claim_time = [[0] * 20 for _ in range(20)]
+            self.grid_changed = False
+            self.final_scores = []
+            
+            # Update GUI
+            self.gui.update_grid(self.grid_state)
+            self.gui.log_message("Game reset. Waiting for players...", "info")
+            
+            # Move all active clients back to waiting room
+            for pid in list(self.clients.keys()):
+                addr = self.clients[pid][0]
+                self.waiting_room_players[pid] = addr
+            
+            self.clients.clear()
+            self.gui.update_players(self.waiting_room_players)
+            
+            # Start new game if we have enough players
+            if len(self.waiting_room_players) >= 1:
+                self.gui.root.after(3000, self._start_game)  # Start after 3 seconds
+
+    def end_game(self):
+            self.game_active = False
+            self._should_send_snapshots = False  #Disable snapshots when game ends
+
+            # Send game over message to all clients
+            for pid in list(self.clients.keys()):
+                try:
+                    self._sr_send(pid, MSG_TYPE_GAME_OVER, b'')
+                except Exception as e:
+                    self.gui.log_message(f"Failed to send game over to player {pid}: {e}", "error")
+            
+            # Clear game state
+            self.grid_state = [[0] * 20 for _ in range(20)]
+            self.grid_claim_time = [[0] * 20 for _ in range(20)]
+            self.grid_changed = False
+            
+            print("[GAME OVER]")
+            self.gui.log_message("Game over", "info")
+            
+            # Update GUI to show empty grid
+            self.gui.update_grid(self.grid_state)
+            self._end_game_with_scores()
+
 
     # ==================== GUI Integration ====================
     def _setup_gui_callbacks(self):
@@ -607,4 +732,3 @@ if __name__ == "__main__":
     else:
         server = GameServer()
         server.start_gui()
-

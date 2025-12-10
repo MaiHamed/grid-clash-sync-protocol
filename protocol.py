@@ -15,6 +15,7 @@ MSG_TYPE_GAME_START = 6
 MSG_TYPE_WAITING_ROOM = 7
 MSG_TYPE_GAME_SETTINGS = 8  # Add this with other message types
 MSG_TYPE_ACK=9
+MSG_TYPE_LEADERBOARD = 10
 
 HEADER_FORMAT = "!4s B B H H I I Q"  #protocol_id(4), version(1), msg_type(1), length(2), snapshot_ID(2), seq_num(4), ack_num(4), timestamp(8)
 HEADER_SIZE = 26
@@ -79,5 +80,30 @@ def unpack_grid_snapshot(payload, rows=20, cols=20):
 
     return grid
 
-def create_ack_packet(ack_num, seq_num=0):
-    return create_header(MSG_TYPE_ACK, seq_num=seq_num, payload_len=0, snapshot_id=0, ack_num=ack_num)
+def create_ack_packet(ack_num, seq_num=0, snapshot_id=0):
+    return create_header(MSG_TYPE_ACK, seq_num, 0, snapshot_id, ack_num)
+
+def pack_leaderboard_data(leaderboard):
+
+    # Format: count (1 byte) + for each entry: player_id (1 byte), score (2 bytes), rank (1 byte)
+    count = len(leaderboard)
+    data = struct.pack("!B", count)
+    for pid, score, rank in leaderboard:
+        data += struct.pack("!BHB", pid, score, rank)
+    return data
+
+def unpack_leaderboard_data(payload):
+    if len(payload) < 1:
+        return []
+    
+    count = struct.unpack("!B", payload[0:1])[0]
+    offset = 1
+    leaderboard = []
+    
+    for _ in range(count):
+        if len(payload) >= offset + 4:  # 1 + 2 + 1 = 4 bytes per entry
+            pid, score, rank = struct.unpack("!BHB", payload[offset:offset+4])
+            leaderboard.append((pid, score, rank))
+            offset += 4
+    
+    return leaderboard

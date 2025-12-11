@@ -511,7 +511,6 @@ class GameServer:
     def _handle_ack(self, player_id, ack_num):
         """
         Handle ACK from client according to SR ARQ protocol.
-        Based on protocol: "AckNum acknowledges all correctly received messages"
         """
         if player_id not in self.client_windows:
             print(f"[ACK] Player {player_id} not found in client_windows")
@@ -523,36 +522,27 @@ class GameServer:
 
         print(f"[ACK] Player {player_id}: ack={ack_num}, base={base}, next={next_seq}, window={list(window.keys())}")
 
-        # According to protocol: "The window advances only when the base packet is acknowledged"
-        # This suggests cumulative ACKs, not selective ACKs
-        
-        # Check if this ACK acknowledges our base packet
-        if ack_num >= base:
-            # Remove all packets up to and including ack_num
-            packets_to_remove = [seq for seq in list(window.keys()) if seq <= ack_num]
+        # SELECTIVE REPEAT: Only remove the specific packet acknowledged
+        if ack_num in window:
+            del window[ack_num]
+            if player_id in self.client_timers and ack_num in self.client_timers[player_id]:
+                del self.client_timers[player_id][ack_num]
             
-            for seq in packets_to_remove:
-                if seq in window:
-                    del window[seq]
-                if player_id in self.client_timers and seq in self.client_timers[player_id]:
-                    del self.client_timers[player_id][seq]
+            print(f"[ACK] Player {player_id}: Removed seq {ack_num}")
             
-            if packets_to_remove:
-                print(f"[ACK] Player {player_id}: Removed packets {packets_to_remove}")
-            
-            # Slide window base forward
-            new_base = ack_num + 1
-            
-            # Continue sliding if consecutive packets are already ACKed
+            # Slide window base forward if the base packet has been acknowledged
+            new_base = base
             while new_base not in window and new_base < next_seq:
                 new_base += 1
             
             if new_base != base:
                 self.client_base[player_id] = new_base
                 print(f"[ACK] Player {player_id}: Window slid base={base} -> {new_base}")
+        
+        elif ack_num < base:
+             print(f"[ACK] Player {player_id}: Ignoring duplicate/old ACK {ack_num} (current base={base})")
         else:
-            # ACK for old packet, ignore
-            print(f"[ACK] Player {player_id}: Ignoring old ACK {ack_num} (current base={base})")
+             print(f"[ACK] Player {player_id}: Ignoring ACK {ack_num} (not in window usually means already ACKed)")
 
     # ==================== Snapshot ====================
     def _send_snapshot(self):

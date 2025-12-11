@@ -58,6 +58,8 @@ class GameServer:
 
         # Start game timer thread
         threading.Thread(target=self._game_timer_thread, daemon=True).start()
+        # Start player timeout checker thread
+        threading.Thread(target=self._player_timeout_thread, daemon=True).start()
 
         # Statistics
         self.stats = {'sent': 0, 'received': 0, 'dropped': 0, 'client_count': 0}
@@ -291,6 +293,8 @@ class GameServer:
 
     # ==================== Server Loop ====================
     def _server_loop(self):
+        last_timeout_check = time.time()
+        
         while self.running:
             try:
                 ready, _, _ = select.select([self.server_socket], [], [], 0.01)
@@ -322,6 +326,36 @@ class GameServer:
                 print(f"[ERROR] in server loop: {e}")
                 self.gui.log_message(f"Server loop error: {e}", "error")
                 time.sleep(0.01)
+
+    # ==================== Player Timeout Thread ====================
+    def _player_timeout_thread(self):
+        """Background thread to check for inactive players"""
+        while self.running:
+            try:
+                self._check_player_timeouts()
+                time.sleep(5)  # Check every 5 seconds
+            except Exception as e:
+                print(f"[ERROR] in player timeout thread: {e}")
+                time.sleep(5)
+
+    def _check_player_timeouts(self):
+        """Check for inactive players and remove them."""
+        if not self.running or not self.clients:
+            return
+        
+        current_time = time.time()
+        players_to_remove = []
+        
+        # Check active clients
+        for player_id, (addr, last_seen) in list(self.clients.items()):
+            if current_time - last_seen > 10:  # 10 seconds timeout
+                players_to_remove.append(player_id)
+                self.gui.log_message(f"Player {player_id} timed out (no activity for 10s)", "warning")
+        
+        # Remove timed out players
+        for player_id in players_to_remove:
+            self._remove_player(player_id)
+            self.gui.log_message(f"Removed Player {player_id} due to timeout", "info")
 
     # ==================== Handle Messages ====================
     def _handle_message(self, data, addr):
@@ -478,39 +512,33 @@ class GameServer:
                 ack_packet = create_ack_packet(ack_num=client_seq)
                 self.server_socket.sendto(ack_packet, addr)
 
-                # Remove the player (search both active and waiting)
-                removed = []
-                for pid, (client_addr, _) in list(self.clients.items()):
-                    if client_addr == addr:
-                        removed.append(pid)
-                for pid, waiting_addr in list(self.waiting_room_players.items()):
-                    if waiting_addr == addr:
-                        removed.append(pid)
-
-                for pid in removed:
-                    self._remove_player(pid)
-                    self.gui.log_message(f"Player {pid} left", "info")
-
-                # Check if game should end (all players left during active game)
-                if self.game_active and not self.clients and not self.waiting_room_players:
-                    self.game_active = False
-                    self._should_send_snapshots = False
-                    self.gui.log_message("All players left. Game ended.", "info")
-                    # Reset grid
-                    self.grid_state = [[0] * 20 for _ in range(20)]
-                    self.grid_claim_time = [[0] * 20 for _ in range(20)]
-                    self.grid_changed = True
-                    self.gui.update_grid(self.grid_state)
-
-                self.stats['client_count'] = len(self.clients) + len(self.waiting_room_players)
-                self.gui.update_players(self.clients if self.clients else self.waiting_room_players)
-                self.gui.update_stats(self.stats)
+                # Find the player ID for this address
+                player_id = self._addr_to_pid(addr)
+                
+                if player_id:
+                    # Check if game is active before removing player
+                    was_game_active = self.game_active
+                    # Remove the player and their claimed cells
+                    self._remove_player_and_cells(player_id)
+                    self.gui.log_message(f"Player {player_id} left gracefully", "info")
+                    
+                    # Check if game should end (less than min_players during active game)
+                    if was_game_active and self.game_active:
+                        active_players = len(self.clients)
+                        if active_players < self.min_players:
+                            self.gui.log_message(f"Less than {self.min_players} players remaining. Ending game...", "warning")
+                            self._end_game_with_scores()
+                else:
+                    self.gui.log_message(f"Unknown player from {addr} left", "warning")
 
             elif msg_type == MSG_TYPE_ACK:
                 player_id = self._addr_to_pid(addr)
                 if player_id:
                     ack_val = header.get("ack_num", 0)
                     self._handle_ack(player_id, ack_val)
+                    # Update last_seen for active players when they send ACK
+                    if player_id in self.clients:
+                        self.clients[player_id] = (addr, time.time())
 
 
             # update stats GUI periodically
@@ -531,8 +559,23 @@ class GameServer:
                 return pid
         return None
 
-    def _remove_player(self, player_id):
-        """Remove a player from all data structures."""
+    def _remove_player_and_cells(self, player_id):
+        """Remove a player and all their claimed cells from the grid."""
+        # Check if player was in active game before removing
+        was_in_active_game = player_id in self.clients
+        
+        # Count cells owned by this player before removal
+        cells_removed = 0
+        if was_in_active_game:
+            # Remove player's claimed cells from the grid
+            for r in range(20):
+                for c in range(20):
+                    if self.grid_state[r][c] == player_id:
+                        self.grid_state[r][c] = 0  # Reset to unclaimed
+                        self.grid_claim_time[r][c] = 0  # Reset timestamp
+                        cells_removed += 1
+        
+        # Remove player from all data structures
         self.clients.pop(player_id, None)
         self.client_windows.pop(player_id, None)
         self.client_timers.pop(player_id, None)
@@ -540,9 +583,25 @@ class GameServer:
         self.client_rtt.pop(player_id, None)
         self.client_send_ts.pop(player_id, None)
         self.client_retrans.pop(player_id, None)
+        self.client_base.pop(player_id, None)
         self.waiting_room_players.pop(player_id, None)
-
-        # If no more active players, stop sending snapshots AND reset grid
+        
+        # Mark grid as changed if we removed any cells
+        if cells_removed > 0:
+            self.grid_changed = True
+            self.gui.update_grid(self.grid_state)
+            self.gui.log_message(f"Removed {cells_removed} cells claimed by Player {player_id}", "info")
+        
+        self.gui.log_message(f"Player {player_id} removed from server", "info")
+        
+        # Check if game should end (active game with less than min_players)
+        if self.game_active and was_in_active_game:
+            active_players = len(self.clients)
+            if active_players < self.min_players:
+                self.gui.log_message(f"Less than {self.min_players} players remaining. Ending game...", "warning")
+                self._end_game_with_scores()
+        
+        # If no more active players at all, stop sending snapshots AND reset grid
         if not self.clients and not self.waiting_room_players:
             self._should_send_snapshots = False
             
@@ -559,6 +618,10 @@ class GameServer:
         self.stats['client_count'] = len(self.clients) + len(self.waiting_room_players)
         self.gui.update_players(self.clients if self.clients else self.waiting_room_players)
         self.gui.update_stats(self.stats)
+
+    def _remove_player(self, player_id):
+        """Wrapper for backward compatibility - calls _remove_player_and_cells."""
+        return self._remove_player_and_cells(player_id)
 
 
     def _handle_ack(self, player_id, ack_num):
@@ -690,15 +753,6 @@ class GameServer:
         self._should_send_snapshots = True
         self.game_start_time = time.time()  # Track when game started
         
-        # TEMPORARY FIX: Clear windows for fresh start
-       # print("[GAME START] Clearing windows for fresh start...")
-        #for pid in list(self.clients.keys()):
-         #   self.client_windows[pid] = {}
-          #  self.client_timers[pid] = {}
-           # self.client_next_seq[pid] = 0
-           # self.client_base[pid] = 0
-           # print(f"  Player {pid}: Window cleared")
-        
         # Convert waiting_room_players (pid->addr) to clients structure (pid->(addr, last_seen))
         for pid, addr in self.waiting_room_players.items():
             self.clients[pid] = (addr, time.time())
@@ -768,7 +822,6 @@ class GameServer:
         # Show leaderboard on server
         self._show_server_leaderboard()
         
-        # DON'T auto-stop - just reset and wait for new players
         # Schedule reset after 5 seconds (give clients time to see scores)
         print("[GAME END] Scheduling auto-reset in 5 seconds")
         self.gui.root.after(5000, self._reset_for_new_game)
@@ -847,9 +900,6 @@ class GameServer:
         
         # Clear final scores
         self.final_scores = []
-        
-        # Reset statistics (keep sent/received counts if you want)
-        # self.stats = {'sent': 0, 'received': 0, 'dropped': 0, 'client_count': 0}
         
         # Update GUI
         self.gui.update_grid(self.grid_state)

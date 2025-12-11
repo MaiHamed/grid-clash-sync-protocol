@@ -5,10 +5,10 @@ import select
 import threading
 from gui import GameGUI
 from protocol import (
-    MSG_TYPE_LEADERBOARD, create_ack_packet, create_header, pack_grid_snapshot, pack_leaderboard_data, parse_header,
+    MSG_TYPE_LEADERBOARD, create_ack_packet, create_packet, pack_grid_snapshot, pack_leaderboard_data, parse_packet,
     MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP,
     MSG_TYPE_CLAIM_REQ, MSG_TYPE_LEAVE, MSG_TYPE_BOARD_SNAPSHOT,
-    MSG_TYPE_ACK, MSG_TYPE_GAME_START, MSG_TYPE_GAME_OVER, HEADER_SIZE,
+    MSG_TYPE_ACK, MSG_TYPE_GAME_START, MSG_TYPE_GAME_OVER, HEADER_SIZE
 )
 
 
@@ -196,13 +196,12 @@ class GameServer:
             return False
     
 
-        # Build header
+        # Build packet (Header + Payload)
+        # Note: create_packet now returns the FULL packet with checksum
         if msg_type == MSG_TYPE_BOARD_SNAPSHOT:
-            header = create_header(msg_type, next_seq, len(payload), self.snapshot_id)
+            packet = create_packet(msg_type, next_seq, payload, self.snapshot_id)
         else:
-            header = create_header(msg_type, next_seq, len(payload))
-
-        packet = header + payload
+            packet = create_packet(msg_type, next_seq, payload)
 
         # Resolve address
         if player_id in self.clients:
@@ -305,7 +304,16 @@ class GameServer:
     # ==================== Handle Messages ====================
     def _handle_message(self, data, addr):
         try:
-            header = parse_header(data)
+            # Parse packet and validate checksum
+            header, payload, valid = parse_packet(data)
+            if not header:
+                 return # Dropped (too short)
+            
+            if not valid:
+                print(f"[CHECKSUM ERROR] from {addr}")
+                self.stats['dropped'] += 1
+                return
+            
             msg_type = header.get("msg_type")
             seq = header.get("seq_num", 0)
             self.stats['received'] += 1
@@ -379,8 +387,8 @@ class GameServer:
                 player_id = self._addr_to_pid(addr)
                 self.server_socket.sendto(ack_packet, addr) #####
                 if player_id:
-                    # Extract claim coordinates and ACK number
-                    pay = data[HEADER_SIZE:HEADER_SIZE + 4] if len(data) >= HEADER_SIZE + 4 else b''
+                    # Payload is now returned by parse_packet
+                    pay = payload if len(payload) >= 4 else b''
                     if len(pay) >= 4:
                         r, c, client_ack_num = struct.unpack("!BBH", pay[:4])
                         

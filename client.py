@@ -8,7 +8,7 @@ import os
 from gui import GameGUI, calculate_scores_from_grid
 from leaderboard import LeaderboardGUI
 from protocol import (
-    MSG_TYPE_LEADERBOARD, create_ack_packet, create_header, parse_header, HEADER_SIZE,
+    MSG_TYPE_LEADERBOARD, create_ack_packet, create_packet, parse_packet, HEADER_SIZE,
     MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP,
     MSG_TYPE_CLAIM_REQ, MSG_TYPE_BOARD_SNAPSHOT, MSG_TYPE_LEAVE,
     MSG_TYPE_GAME_START, MSG_TYPE_GAME_OVER,
@@ -112,7 +112,7 @@ class GameClient:
     def _sr_send(self, msg_type, payload=b''):
         if self.nextSeqNum < self.base + self.N:
             seq = self.nextSeqNum  # Get the sequence number
-            packet = create_header(msg_type, seq, len(payload)) + payload
+            packet = create_packet(msg_type, seq, payload)
             try:
                 self.client_socket.sendto(packet, (self.server_ip, self.server_port))
             except Exception as e:
@@ -195,7 +195,7 @@ class GameClient:
         if leave_seq is False:
             # Couldn't send (window full or socket error) — fallback: try raw send once
             try:
-                packet = create_header(MSG_TYPE_LEAVE, 0, 0)
+                packet = create_packet(MSG_TYPE_LEAVE, 0, b'')
                 self.client_socket.sendto(packet, (self.server_ip, self.server_port))
             except Exception:
                 pass
@@ -251,10 +251,20 @@ class GameClient:
                 recv_ms = current_time_ms()
                 if len(data) < HEADER_SIZE:
                     continue
-                header = parse_header(data)
+                
+                # Parse and validate checksum
+                header, payload, valid = parse_packet(data)
+                
+                if not header:
+                    continue
+                if not valid:
+                    print(f"[CHECKSUM ERROR] Invalid packet received")
+                    self.stats['dropped'] += 1
+                    continue
+                    
                 seq = header["seq_num"]
                 msg_type = header["msg_type"]
-                payload = data[HEADER_SIZE:]
+                # Payload is returned by parse_packet
 
                 if msg_type == MSG_TYPE_ACK:
                     ack_val = header.get("ack_num", 0)
@@ -586,7 +596,7 @@ class GameClient:
         # 2. Send leave message to server (use regular send, not SR ARQ)
         if self.client_socket:
             try:
-                leave_packet = create_header(MSG_TYPE_LEAVE, 0, 0)
+                leave_packet = create_packet(MSG_TYPE_LEAVE, 0, b'')
                 self.client_socket.sendto(leave_packet, (self.server_ip, self.server_port))
                 print(f"[CLIENT {self.player_id}] Sent LEAVE message to server")
             except Exception as e:

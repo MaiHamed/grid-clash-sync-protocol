@@ -11,7 +11,6 @@ SERVER_PORT=5005
 SERVER_IP="127.0.0.1"
 NUM_CLIENTS=${1:-8}      # Number of headless test clients
 DURATION=${2:-30}        # Duration per scenario
-CLAIMS_PER_SEC=2         # Client send rate
 OUTDIR_BASE="results"
 IFACE="lo" 
 ### Directories ###

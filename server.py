@@ -496,8 +496,8 @@ class GameServer:
                 if player_id:
                     # Check if game is active before removing player
                     was_game_active = self.game_active
-                    # Remove the player
-                    self._remove_player(player_id)
+                    # Remove the player and their claimed cells
+                    self._remove_player_and_cells(player_id)
                     self.gui.log_message(f"Player {player_id} left gracefully", "info")
                     
                     # Check if game should end (less than min_players during active game)
@@ -537,10 +537,21 @@ class GameServer:
                 return pid
         return None
 
-    def _remove_player(self, player_id):
-        """Remove a player from all data structures and check game status."""
+    def _remove_player_and_cells(self, player_id):
+        """Remove a player and all their claimed cells from the grid."""
         # Check if player was in active game before removing
         was_in_active_game = player_id in self.clients
+        
+        # Count cells owned by this player before removal
+        cells_removed = 0
+        if was_in_active_game:
+            # Remove player's claimed cells from the grid
+            for r in range(20):
+                for c in range(20):
+                    if self.grid_state[r][c] == player_id:
+                        self.grid_state[r][c] = 0  # Reset to unclaimed
+                        self.grid_claim_time[r][c] = 0  # Reset timestamp
+                        cells_removed += 1
         
         # Remove player from all data structures
         self.clients.pop(player_id, None)
@@ -549,6 +560,12 @@ class GameServer:
         self.client_next_seq.pop(player_id, None)
         self.client_base.pop(player_id, None)
         self.waiting_room_players.pop(player_id, None)
+        
+        # Mark grid as changed if we removed any cells
+        if cells_removed > 0:
+            self.grid_changed = True
+            self.gui.update_grid(self.grid_state)
+            self.gui.log_message(f"Removed {cells_removed} cells claimed by Player {player_id}", "info")
         
         self.gui.log_message(f"Player {player_id} removed from server", "info")
         
@@ -576,6 +593,10 @@ class GameServer:
         self.stats['client_count'] = len(self.clients) + len(self.waiting_room_players)
         self.gui.update_players(self.clients if self.clients else self.waiting_room_players)
         self.gui.update_stats(self.stats)
+
+    def _remove_player(self, player_id):
+        """Wrapper for backward compatibility - calls _remove_player_and_cells."""
+        return self._remove_player_and_cells(player_id)
 
 
     def _handle_ack(self, player_id, ack_num):

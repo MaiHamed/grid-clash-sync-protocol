@@ -262,6 +262,11 @@ class GameClient:
                     ack_val = header.get("ack_num", 0)
                     self._handle_ack(ack_val, recv_ms)
                     continue
+                #########
+                if msg_type == MSG_TYPE_JOIN_RESP:
+                    ack_val = header.get("ack_num", 0)
+                    self._handle_ack(ack_val, recv_ms)
+                
  
                 ack_packet = create_ack_packet(seq)
                 try:
@@ -325,7 +330,7 @@ class GameClient:
         
         # Store received ACK number for CLAIM_REQUESTs
         self.last_ack_num = seq
-        
+        print(f"[DEBUG] Incoming Seq: {seq} | Expected: {self.expected_seq}")
         # Process packet based on sequence number
         if seq == self.expected_seq:
             self._process_packet(msg_type, payload, header)
@@ -346,7 +351,7 @@ class GameClient:
 
     def _process_packet(self, msg_type, payload, header):
         if msg_type == MSG_TYPE_JOIN_RESP:
-            self.player_id = struct.unpack("!B", payload)[0]
+            self.player_id = struct.unpack("!B", payload)[0]                                                                                                                                                                                                                            
             self.gui.update_player_info(f"Player {self.player_id} (Waiting)", True)
             self.gui.log_message(f"Joined as Player {self.player_id}", "success")
         

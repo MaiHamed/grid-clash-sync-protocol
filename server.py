@@ -354,12 +354,12 @@ class GameServer:
                 if self.game_active:
                     if len(self.clients) < 4:
                         # Reset all existing players' windows to prevent blocking
-                        for pid in list(self.clients.keys()):
-                            if pid in self.client_windows:
-                                self.client_windows[pid].clear()
-                                self.client_timers[pid].clear()
-                                self.client_next_seq[pid] = 0
-                                self.client_base[pid] = 0
+                        #for pid in list(self.clients.keys()):
+                           # if pid in self.client_windows:
+                               # self.client_windows[pid].clear()
+                               # self.client_timers[pid].clear()
+                                #self.client_next_seq[pid] = 0
+                                #self.client_base[pid] = 0      
                         
                         # NOW add the new player to active game
                         self.clients[new_pid] = (addr, time.time())
@@ -617,13 +617,13 @@ class GameServer:
         self.game_start_time = time.time()  # Track when game started
         
         # TEMPORARY FIX: Clear windows for fresh start
-        print("[GAME START] Clearing windows for fresh start...")
-        for pid in list(self.clients.keys()):
-            self.client_windows[pid] = {}
-            self.client_timers[pid] = {}
-            self.client_next_seq[pid] = 0
-            self.client_base[pid] = 0
-            print(f"  Player {pid}: Window cleared")
+       # print("[GAME START] Clearing windows for fresh start...")
+        #for pid in list(self.clients.keys()):
+         #   self.client_windows[pid] = {}
+          #  self.client_timers[pid] = {}
+           # self.client_next_seq[pid] = 0
+           # self.client_base[pid] = 0
+           # print(f"  Player {pid}: Window cleared")
         
         # Convert waiting_room_players (pid->addr) to clients structure (pid->(addr, last_seen))
         for pid, addr in self.waiting_room_players.items():

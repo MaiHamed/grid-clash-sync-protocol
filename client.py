@@ -50,7 +50,7 @@ class GameClient:
         self.game_active = False
         self.waiting_for_game = True
         self.game_start_time = None
-        self.game_duration = 20
+        self.game_duration = 100
         self._game_over_handled = False
         self.final_scores = []
 

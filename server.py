@@ -652,50 +652,49 @@ class GameServer:
             self.gui.log_message(f"Failed to send initial snapshot after game start: {e}", "error")
     
     def _end_game_with_scores(self):
+        """End the game and calculate scores"""
+        # Only proceed if game was active
         if not self.game_active:
+            print("[DEBUG] Game already ended, skipping _end_game_with_scores")
             return
             
+        print("[GAME END] Starting game end process...")
         self.game_active = False
         self._should_send_snapshots = False
         
-        # Calculate final scores
-        self.final_scores = calculate_scores_from_grid(self.grid_state)
-        
-        # Log scores on server
-        score_str = ", ".join([f"Player {pid}: {score}" for pid, score in self.final_scores])
-        self.gui.log_message(f"Game Over! Final scores: {score_str}", "info")
-        
-        # Create leaderboard payload
-        leaderboard_payload = pack_leaderboard_data(self.final_scores)
-        
-        # Send game over message to all clients FIRST
+        # Send game over to all clients
+        print(f"[GAME END] Sending GAME_OVER to {len(self.clients)} clients")
         for pid in list(self.clients.keys()):
             try:
-                print(f"[SERVER] Sending GAME_OVER to Player {pid}")
                 self._sr_send(pid, MSG_TYPE_GAME_OVER, b'')
             except Exception as e:
-                self.gui.log_message(f"Failed to send game over to player {pid}: {e}", "error")
+                print(f"[ERROR] Failed to send game over to player {pid}: {e}")
         
-        # Send leaderboard data after a SHORTER delay
-        time.sleep(0.1)  # Reduced from 0.5 to 0.1 seconds
+        # Wait a bit for clients to process game over
+        time.sleep(0.5)
         
-        # Send leaderboard to all clients
-        sent_count = 0
+        # Calculate scores
+        self.final_scores = calculate_scores_from_grid(self.grid_state)
+        print(f"[GAME END] Final scores: {self.final_scores}")
+        
+        # Send leaderboard
+        leaderboard_payload = pack_leaderboard_data(self.final_scores)
         for pid in list(self.clients.keys()):
             try:
-                print(f"[SERVER] Sending LEADERBOARD to Player {pid}")
-                # Send leaderboard data
-                success = self._sr_send(pid, MSG_TYPE_LEADERBOARD, leaderboard_payload)
-                if success:
-                    sent_count += 1
-                    self.gui.log_message(f"Leaderboard sent to Player {pid}", "info")
+                self._sr_send(pid, MSG_TYPE_LEADERBOARD, leaderboard_payload)
             except Exception as e:
-                self.gui.log_message(f"Failed to send leaderboard to player {pid}: {e}", "error")
+                print(f"[ERROR] Failed to send leaderboard to player {pid}: {e}")
         
-        print(f"[SERVER] GAME OVER] Scores sent to {sent_count} client(s)")
+        # Update server GUI
+        score_str = ", ".join([f"Player {pid}: {score}" for pid, score in self.final_scores])
+        self.gui.log_message(f"Game Over! Scores: {score_str}", "info")
         
-        # Show leaderboard on server GUI too
+        # Show leaderboard on server
         self._show_server_leaderboard()
+        
+        # Auto-stop server after delay
+        print("[GAME END] Scheduling auto-stop in 30 seconds")
+        self.gui.root.after(30000, self.stop)
 
     def _show_server_leaderboard(self):
         """Show leaderboard on server GUI"""

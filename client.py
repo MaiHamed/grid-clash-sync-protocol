@@ -53,8 +53,6 @@ class GameClient:
         self.final_scores = []
 
 
-
-
         # Grid
         self.local_grid = [[0]*20 for _ in range(20)]
         self.claimed_cells = set()
@@ -68,8 +66,7 @@ class GameClient:
         self._setup_gui_callbacks()
         self.game_timer_id = None
         self.gui.set_restart_callback(self.restart_game)
-
-
+        
         # Automatically connect when GUI starts
         self.gui.root.after(500, self.connect)
 
@@ -283,37 +280,35 @@ class GameClient:
 
     # ==================== PACKET HANDLING ====================
     def _handle_ack(self, seq, recv_ms):
+        """Handle ACK with cumulative acknowledgment logic"""
+        print(f"[ACK HANDLER] Received ACK for seq={seq}, current base={self.base}")
+        
+        # If ACK is for a packet we have in window
         if seq in self.window:
-            # Only update RTT if this packet was never retransmitted
-            if self.stats.get('retransmissions', 0) and seq in self.timers:
-                # Check if it was retransmitted
-                retransmitted = False
-                if hasattr(self, "_retransmitted_seqs"):
-                    retransmitted = seq in self._retransmitted_seqs
-                else:
-                    self._retransmitted_seqs = set()
-                    retransmitted = False
-            else:
-                retransmitted = False
-
-            sent_time = self.send_timestamp.get(seq, recv_ms)
-
-            if not retransmitted:
-                sampleRTT = recv_ms - sent_time
+            # Update RTT if not retransmitted
+            if seq in self.send_timestamp:
+                sampleRTT = recv_ms - self.send_timestamp[seq]
                 self.estimatedRTT = (1 - self.alpha) * self.estimatedRTT + self.alpha * sampleRTT
                 self.devRTT = (1 - self.beta) * self.devRTT + self.beta * abs(sampleRTT - self.estimatedRTT)
-                self.RTO = self.estimatedRTT + 4*self.devRTT
-
-            # Clean up
+                self.RTO = self.estimatedRTT + 4 * self.devRTT
+            
+            # Remove acknowledged packet
             del self.window[seq]
-            del self.timers[seq]
-            del self.send_timestamp[seq]
-            if hasattr(self, "_retransmitted_seqs"):
-                self._retransmitted_seqs.discard(seq)
-
-            # Slide base
-            while self.base not in self.window and self.base < self.nextSeqNum:
-                self.base += 1
+            if seq in self.timers:
+                del self.timers[seq]
+            if seq in self.send_timestamp:
+                del self.send_timestamp[seq]
+        
+        # Slide window base forward
+        # In SR ARQ, we can slide base to the smallest unacknowledged packet
+        while self.base in self.window:
+            self.base += 1
+        
+        # Also check if we need to adjust base for packets we don't have anymore
+        while self.base not in self.window and self.base < self.nextSeqNum:
+            self.base += 1
+        
+        print(f"[ACK HANDLER] New base={self.base}, window size={len(self.window)}")
 
     ######## if seq no < less than expected_seq reciever should send ack but not process the packet ########
     def _handle_data_packet(self, seq, msg_type, payload, header):
@@ -350,6 +345,8 @@ class GameClient:
             print(f"[CLIENT {self.player_id}] Received duplicate packet seq={seq}")
 
     def _process_packet(self, msg_type, payload, header):
+        seq = header.get("seq_num", 0)
+        
         if msg_type == MSG_TYPE_JOIN_RESP:
             self.player_id = struct.unpack("!B", payload)[0]                                                                                                                                                                                                                            
             self.gui.update_player_info(f"Player {self.player_id} (Waiting)", True)

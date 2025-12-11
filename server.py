@@ -273,12 +273,21 @@ class GameServer:
             try:
                 ack_packet = create_ack_packet(ack_num=seq)
                 # Use server_socket (fixed bug from earlier version)
-                self.server_socket.sendto(ack_packet, addr)
+                #self.server_socket.sendto(ack_packet, addr)  #####
                 print(f"[SEND ACK] seq={seq}, to={addr}")
             except Exception as e:
                 print(f"[ERROR] sending ACK to {addr}: {e}")
 
             if msg_type == MSG_TYPE_JOIN_REQ:
+                existing_pid = self._addr_to_pid(addr)
+                if existing_pid is not None:
+                    print(f"[INFO] Duplicate join request from {addr} (Player {existing_pid})")
+                    # If they are already joined, just resend the Join Response 
+                    # (The client might have missed the first ACK/Response)
+                    payload = struct.pack("!B", existing_pid)
+                    self._sr_send(existing_pid, MSG_TYPE_JOIN_RESP, payload)
+                    return # Stop here, do not create a new player
+                # --- FIX END ---
                 # Assign unique player id 
                 new_pid = 1
                 while new_pid in self.waiting_room_players or new_pid in self.clients:
@@ -316,7 +325,7 @@ class GameServer:
             elif msg_type == MSG_TYPE_CLAIM_REQ:
                 # Determine player id by address lookup
                 player_id = self._addr_to_pid(addr)
-
+                self.server_socket.sendto(ack_packet, addr) #####
                 if player_id:
                     # Extract claim coordinates
                     pay = data[HEADER_SIZE:HEADER_SIZE + 2] if len(data) >= HEADER_SIZE + 2 else b''
@@ -405,7 +414,8 @@ class GameServer:
             elif msg_type == MSG_TYPE_ACK:
                 player_id = self._addr_to_pid(addr)
                 if player_id:
-                    self._handle_ack(player_id, seq)
+                    ack_val = header.get("ack_num", 0)
+                    self._handle_ack(player_id, ack_val)
 
 
             # update stats GUI periodically

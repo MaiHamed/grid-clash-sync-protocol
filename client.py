@@ -48,7 +48,7 @@ class GameClient:
         self.game_active = False
         self.waiting_for_game = True
         self.game_start_time = None
-        self.game_duration = 10
+        self.game_duration = 100
         self._game_over_handled = False
 
 
@@ -244,9 +244,10 @@ class GameClient:
                 payload = data[HEADER_SIZE:]
 
                 if msg_type == MSG_TYPE_ACK:
-                    self._handle_ack(seq, recv_ms)
+                    ack_val = header.get("ack_num", 0)
+                    self._handle_ack(ack_val, recv_ms)
                     continue
-
+ 
                 ack_packet = create_ack_packet(seq)
                 try:
                     self.client_socket.sendto(ack_packet, addr)
@@ -294,7 +295,7 @@ class GameClient:
             while self.base not in self.window and self.base < self.nextSeqNum:
                 self.base += 1
 
-
+    ######## if seq no < less than expected_seq reciever should send ack but not process the packet ########
     def _handle_data_packet(self, seq, msg_type, payload, header):
         if seq == self.expected_seq:
             self._process_packet(msg_type, payload, header)

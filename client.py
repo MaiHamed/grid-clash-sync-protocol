@@ -87,10 +87,15 @@ class GameClient:
             self.gui.log_message("Game hasn't started yet", "warning")
             return
         
+        current_owner = self.local_grid[row][col]
         # Check if cell is already claimed (by anyone)
         if self.local_grid[row][col] != 0:
-            self.gui.log_message(f"Cell ({row},{col}) already claimed!", "warning")
-            return
+            self.gui.log_message(f"Attempting to steal cell ({row},{col}) from Player {current_owner}...", "info")
+            #return
+        
+        #if current_owner == self.player_id:
+         #   self.gui.log_message(f"You already own cell ({row},{col})!", "warning")
+          #  return
         
         # OPTIMISTIC UPDATE: Immediately update local grid and GUI with player color
         self.local_grid[row][col] = self.player_id
@@ -104,7 +109,7 @@ class GameClient:
             self.gui.log_message(f"Request to claim ({row},{col}) sent.", "claim")
         else:
             # If send failed, revert the optimistic update
-            self.local_grid[row][col] = 0
+            self.local_grid[row][col] = current_owner # revert to past owner not 0 !!!
             self.claimed_cells.discard((row, col))
             self.gui.update_grid(self.local_grid)
 

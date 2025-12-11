@@ -3,6 +3,8 @@ import struct
 import time
 import sys
 import threading
+import subprocess
+import os
 from gui import GameGUI, calculate_scores_from_grid
 from leaderboard import LeaderboardGUI
 from protocol import (
@@ -48,10 +50,9 @@ class GameClient:
         self.game_active = False
         self.waiting_for_game = True
         self.game_start_time = None
-        self.game_duration = 100
+        self.game_duration = 20
         self._game_over_handled = False
         self.final_scores = []
-
 
         # Grid
         self.local_grid = [[0]*20 for _ in range(20)]
@@ -66,7 +67,7 @@ class GameClient:
         self._setup_gui_callbacks()
         self.game_timer_id = None
         self.gui.set_restart_callback(self.restart_game)
-        
+
         # Automatically connect when GUI starts
         self.gui.root.after(500, self.connect)
 
@@ -310,7 +311,6 @@ class GameClient:
         
         print(f"[ACK HANDLER] New base={self.base}, window size={len(self.window)}")
 
-    ######## if seq no < less than expected_seq reciever should send ack but not process the packet ########
     def _handle_data_packet(self, seq, msg_type, payload, header):
         """
         Handle data packet from server according to SR ARQ protocol.
@@ -346,12 +346,28 @@ class GameClient:
 
     def _process_packet(self, msg_type, payload, header):
         seq = header.get("seq_num", 0)
-        
+
         if msg_type == MSG_TYPE_JOIN_RESP:
             self.player_id = struct.unpack("!B", payload)[0]                                                                                                                                                                                                                            
             self.gui.update_player_info(f"Player {self.player_id} (Waiting)", True)
             self.gui.log_message(f"Joined as Player {self.player_id}", "success")
         
+            new_player_id = struct.unpack("!B", payload)[0]
+            
+            # If this is our first time getting a player ID
+            if self.player_id is None:
+                self.player_id = new_player_id
+                self.gui.update_player_info(f"Player {self.player_id} (Waiting)", True)
+                self.gui.log_message(f"Joined as Player {self.player_id}", "success")
+                print(f"[CLIENT] Assigned Player ID: {self.player_id}")
+            # If we already have a player ID but this is confirming it
+            elif self.player_id == new_player_id:
+                # This is just a confirmation/retransmission, don't log again
+                print(f"[CLIENT] Received confirmation of Player ID: {self.player_id}")
+            else:
+                # This shouldn't happen, but log it
+                print(f"[WARNING] Received different Player ID: {new_player_id}, already have: {self.player_id}")
+
         elif msg_type == MSG_TYPE_GAME_START:
             self.game_active = True
             self.waiting_for_game = False
@@ -363,7 +379,7 @@ class GameClient:
         elif msg_type == MSG_TYPE_GAME_OVER:
             # Store that we received game over, but wait for leaderboard
             self.game_active = False
-            self.received_game_over = True  # Add this flag
+            self.received_game_over = True
             self.gui.log_message("Game Over! Waiting for final scores...", "info")
             
             # Start a timer to check if leaderboard arrives within timeout
@@ -442,7 +458,6 @@ class GameClient:
                 players_map = {pid: None for pid in sorted(players_in_grid)}
                 self.gui.update_players(players_map)
 
-
     # ==================== GAME ACTIONS ====================
     def _send_claim_request(self, row, col):
         """Send claim request using SR-ARQ with proper ACK number."""
@@ -474,6 +489,7 @@ class GameClient:
         except Exception as e:
             self.gui.log_message(f"Claim preparation error: {e}", "error")
             return False
+    
     def _start_game_timer(self):
         if not self.game_active or not self.game_start_time:
             return
@@ -496,6 +512,7 @@ class GameClient:
         self.game_timer_id = self.gui.root.after(1000, self._start_game_timer)
 
     def _handle_game_over(self):
+        """Handle game over locally when no server leaderboard arrives"""
         # Prevent multiple calls
         if not self.game_active and hasattr(self, '_game_over_handled') and self._game_over_handled:
             return
@@ -514,56 +531,131 @@ class GameClient:
         self.gui.log_message("GAME OVER! 🏁", "info")
         self.gui.root.title("Grid Game Client - Game Over")
         
-        # Calculate scores from CURRENT grid (which has all players)
+        # Calculate scores from CURRENT grid
         final_grid = [row[:] for row in self.local_grid]
         scores = calculate_scores_from_grid(final_grid)
         
-        # Log all players found
-        player_ids = set()
-        for row in final_grid:
-            for cell in row:
-                if cell != 0:
-                    player_ids.add(cell)
-        
-        self.gui.log_message(f"Found players in final grid: {sorted(player_ids)}", "info")
-        
-        # Show leaderboard with all players
+        # Show leaderboard
         self._show_leaderboard(scores)
-    
+
+    def _handle_leaderboard_timeout(self):
+        """Handle when server doesn't send leaderboard"""
+        self.gui.log_message("No leaderboard received from server.", "warning")
+        self._handle_game_over()
+
     def _show_server_leaderboard(self):
-            if self.final_scores:
-                # Use the scores from server
-                self.gui.root.after(0, lambda: self._show_leaderboard(self.final_scores))
-            else:
-                # Fallback to local calculation
-                self.gui.root.after(0, self._handle_game_over)
+        """Show leaderboard with server scores"""
+        if self.final_scores:
+            # Show leaderboard with server scores
+            self._show_leaderboard(self.final_scores)
+        else:
+            # Fallback to local calculation
+            self._handle_game_over()
 
     def _show_leaderboard(self, scores):
         """Show leaderboard with given scores"""
+        print(f"[CLIENT {self.player_id}] Showing leaderboard")
+        
+        # Make sure we close any existing leaderboard
+        if hasattr(self, 'leaderboard') and self.leaderboard:
+            try:
+                self.leaderboard.window.destroy()
+            except:
+                pass
+        
+        # Create new leaderboard with our restart callback
         self.leaderboard = LeaderboardGUI(
             self.gui.root,
             scores,
             play_again_callback=self.restart_game
         )
-    
+
     def restart_game(self):
-        self._game_over_handled = False
-        self.waiting_for_game = True
+        """Handle play again button - Close client and open waiting room"""
+        print(f"[CLIENT {self.player_id}] Play Again clicked - Closing and opening waiting room")
         
-        # Reset local state
-        self.local_grid = [[0]*20 for _ in range(20)]
-        self.claimed_cells.clear()
-        self.final_scores = []
+        # 1. Close leaderboard if it exists
+        if hasattr(self, 'leaderboard') and self.leaderboard:
+            try:
+                if hasattr(self.leaderboard, 'window') and self.leaderboard.window:
+                    self.leaderboard.window.destroy()
+                self.leaderboard = None
+            except Exception as e:
+                print(f"[CLIENT {self.player_id}] Error closing leaderboard: {e}")
         
-        # Update GUI
-        self.gui.update_grid(self.local_grid)
-        self.gui.update_player_info(f"Player {self.player_id} (Waiting)", True)
-        self.gui.log_message("Ready for new game...", "info")
+        # 2. Send leave message to server (use regular send, not SR ARQ)
+        if self.client_socket:
+            try:
+                leave_packet = create_header(MSG_TYPE_LEAVE, 0, 0)
+                self.client_socket.sendto(leave_packet, (self.server_ip, self.server_port))
+                print(f"[CLIENT {self.player_id}] Sent LEAVE message to server")
+            except Exception as e:
+                print(f"[CLIENT {self.player_id}] Error sending LEAVE: {e}")
         
-        # Request to join new game
-        if self.client_socket and self.running:
-            self._sr_send(MSG_TYPE_JOIN_REQ, payload=b'')
-            self.gui.log_message("Requested to join new game", "info")
+        # 3. Stop running flag to stop threads
+        self.running = False
+        
+        # 4. Launch waiting room FIRST (before closing window)
+        self._launch_waiting_room()
+        
+        # 5. Close the client window after a short delay
+        if self.gui and self.gui.root:
+            self.gui.root.after(100, self._close_client)
+
+    def _launch_waiting_room(self):
+        """Launch waiting room program"""
+        print("[CLIENT] Launching or joining waiting room...")
+        
+        # Determine the path to waiting_room.py
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        waiting_room_path = os.path.join(script_dir, "waiting_room.py")
+        
+        try:
+            # First try to send "add player" request to existing waiting room
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(1.0)
+                sock.sendto(b"ADD_PLAYER", ("127.0.0.1", 5006))  # Waiting room port
+                
+                response, _ = sock.recvfrom(1024)
+                if response == b"OK":
+                    print("[CLIENT] Successfully added to existing waiting room")
+                    sock.close()
+                    return
+            except:
+                pass  # No existing waiting room or timeout
+            
+            # If no existing waiting room, start a new one
+            print("[CLIENT] Starting new waiting room...")
+            subprocess.Popen([sys.executable, waiting_room_path])
+            print("[CLIENT] Waiting room launched successfully")
+            
+        except Exception as e:
+            print(f"[CLIENT] Error: {e}")
+            # Fallback: just open normally
+            subprocess.Popen([sys.executable, waiting_room_path])
+
+    def _close_client(self):
+        """Close the client application"""
+        print(f"[CLIENT {self.player_id}] Closing client...")
+        
+        # Close the GUI window
+        if self.gui and self.gui.root:
+            try:
+                self.gui.root.destroy()
+            except:
+                pass
+        
+        # Close socket
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except:
+                pass
+        
+        # Exit the process
+        print(f"[CLIENT {self.player_id}] Exiting process...")
+        sys.exit(0)
 
     # ==================== START GUI ====================
     def start(self):

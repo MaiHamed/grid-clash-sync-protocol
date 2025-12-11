@@ -461,10 +461,20 @@ class GameServer:
                     self._remove_player(pid)
                     self.gui.log_message(f"Player {pid} left", "info")
 
+                # Check if game should end (all players left during active game)
+                if self.game_active and not self.clients and not self.waiting_room_players:
+                    self.game_active = False
+                    self._should_send_snapshots = False
+                    self.gui.log_message("All players left. Game ended.", "info")
+                    # Reset grid
+                    self.grid_state = [[0] * 20 for _ in range(20)]
+                    self.grid_claim_time = [[0] * 20 for _ in range(20)]
+                    self.grid_changed = True
+                    self.gui.update_grid(self.grid_state)
+
                 self.stats['client_count'] = len(self.clients) + len(self.waiting_room_players)
                 self.gui.update_players(self.clients if self.clients else self.waiting_room_players)
                 self.gui.update_stats(self.stats)
-
 
             elif msg_type == MSG_TYPE_ACK:
                 player_id = self._addr_to_pid(addr)
@@ -499,14 +509,24 @@ class GameServer:
         self.client_next_seq.pop(player_id, None)
         self.waiting_room_players.pop(player_id, None)
 
-        #If no more active players, stop sending snapshots
-        if not self.clients:
+        # If no more active players, stop sending snapshots AND reset grid
+        if not self.clients and not self.waiting_room_players:
             self._should_send_snapshots = False
+            
+            # Reset grid when all players have left
+            self.grid_state = [[0] * 20 for _ in range(20)]
+            self.grid_claim_time = [[0] * 20 for _ in range(20)]
+            self.grid_changed = True  # This will trigger a snapshot if new players join
+            
+            # Update GUI to show empty grid
+            self.gui.update_grid(self.grid_state)
+            self.gui.log_message("All players left. Grid reset.", "info")
 
         # Update GUI & stats
         self.stats['client_count'] = len(self.clients) + len(self.waiting_room_players)
         self.gui.update_players(self.clients if self.clients else self.waiting_room_players)
         self.gui.update_stats(self.stats)
+
 
     def _handle_ack(self, player_id, ack_num):
         """
@@ -642,8 +662,7 @@ class GameServer:
             self.gui.log_message(f"Failed to send initial snapshot after game start: {e}", "error")
     
     def _end_game_with_scores(self):
-        """End the game and calculate scores"""
-        # Only proceed if game was active
+        """End the game, send scores, and reset for new players"""
         if not self.game_active:
             print("[DEBUG] Game already ended, skipping _end_game_with_scores")
             return
@@ -675,16 +694,20 @@ class GameServer:
             except Exception as e:
                 print(f"[ERROR] Failed to send leaderboard to player {pid}: {e}")
         
-        # Update server GUI
+        # Wait for leaderboard to be sent
+        time.sleep(1)
+        
+        # Update server GUI with final scores
         score_str = ", ".join([f"Player {pid}: {score}" for pid, score in self.final_scores])
-        self.gui.log_message(f"Game Over! Scores: {score_str}", "info")
+        self.gui.log_message(f"Game Over! Final scores: {score_str}", "info")
         
         # Show leaderboard on server
         self._show_server_leaderboard()
         
-        # Auto-stop server after delay
-        print("[GAME END] Scheduling auto-stop in 30 seconds")
-        self.gui.root.after(30000, self.stop)
+        # DON'T auto-stop - just reset and wait for new players
+        # Schedule reset after 5 seconds (give clients time to see scores)
+        print("[GAME END] Scheduling auto-reset in 5 seconds")
+        self.gui.root.after(5000, self._reset_for_new_game)
 
     def _show_server_leaderboard(self):
         """Show leaderboard on server GUI"""
@@ -706,29 +729,74 @@ class GameServer:
         except Exception as e:
             print(f"[ERROR] Could not show server leaderboard: {e}")
 
+    def _reset_for_new_game(self):
+        """Reset server for new game without stopping"""
+        print("[SERVER] Resetting for new game...")
+        
+        # 1. Send disconnect/reset message to any remaining clients
+        for pid in list(self.clients.keys()):
+            try:
+                # Send a reset message (optional)
+                self._sr_send(pid, MSG_TYPE_GAME_OVER, b'')
+            except:
+                pass
+        
+        # 2. Clear all game state but keep server running
+        self._reset_game_state()
+        
+        # 3. Log that server is ready for new players
+        self.gui.log_message("Server reset complete. Ready for new players!", "success")
+        
+        # 4. Keep server socket open and listening
+        print("[SERVER] Reset complete. Waiting for new players...")
+
+    def _reset_game_state(self):
+        """Reset all game state while keeping server running"""
+        print("[SERVER] Resetting game state...")
+        
+        # Reset grid
+        self.grid_state = [[0] * 20 for _ in range(20)]
+        self.grid_claim_time = [[0] * 20 for _ in range(20)]
+        self.grid_changed = False
+        
+        # Reset game state
+        self.game_active = False
+        self._should_send_snapshots = False
+        self.game_start_time = None
+        
+        # Clear all players
+        self.clients.clear()
+        self.waiting_room_players.clear()
+        
+        # Clear SR ARQ windows
+        self.client_windows.clear()
+        self.client_timers.clear()
+        self.client_next_seq.clear()
+        self.client_base.clear()
+        
+        # Reset sequence numbers (optional, you might want to keep them)
+        self.snapshot_id = 0
+        self.seq_num = 0
+        
+        # Clear final scores
+        self.final_scores = []
+        
+        # Reset statistics (keep sent/received counts if you want)
+        # self.stats = {'sent': 0, 'received': 0, 'dropped': 0, 'client_count': 0}
+        
+        # Update GUI
+        self.gui.update_grid(self.grid_state)
+        self.gui.update_players({})
+        self.gui.update_stats(self.stats)
+        self.gui.log_message("Game state cleared. Ready for new players!", "info")
+
     def _restart_game(self):
-            """Restart the game after leaderboard"""
-            # Reset game state
-            self.grid_state = [[0] * 20 for _ in range(20)]
-            self.grid_claim_time = [[0] * 20 for _ in range(20)]
-            self.grid_changed = False
-            self.final_scores = []
-            
-            # Update GUI
-            self.gui.update_grid(self.grid_state)
-            self.gui.log_message("Game reset. Waiting for players...", "info")
-            
-            # Move all active clients back to waiting room
-            for pid in list(self.clients.keys()):
-                addr = self.clients[pid][0]
-                self.waiting_room_players[pid] = addr
-            
-            self.clients.clear()
-            self.gui.update_players(self.waiting_room_players)
-            
-            # Start new game if we have enough players
-            if len(self.waiting_room_players) >= 1:
-                self.gui.root.after(3000, self._start_game)  # Start after 3 seconds
+        """Reset server for new game (called from leaderboard Play Again button)"""
+        print("[SERVER] Manual restart requested from leaderboard")
+        
+        # Instead of auto-restarting (which stops and starts), just reset
+        self.gui.log_message("Resetting for new game...", "info")
+        self._reset_for_new_game()
 
     def end_game(self):
             self.game_active = False

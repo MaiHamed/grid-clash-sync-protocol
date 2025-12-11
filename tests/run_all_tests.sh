@@ -13,7 +13,7 @@ NUM_CLIENTS=${1:-8}      # Number of headless test clients
 DURATION=${2:-30}        # Duration per scenario
 CLAIMS_PER_SEC=2         # Client send rate
 OUTDIR_BASE="results"
-
+IFACE="lo" 
 ### Directories ###
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # Project root (server.py location)
@@ -91,10 +91,7 @@ scenario_runner() {
     IFACE=${NETEM_IFACE:-$(ip route get 1.1.1.1 | awk '/dev/ {print $5}' | head -n1)}
     echo "[NET] Using interface: $IFACE"
 
-    # Apply impairment
-    if [ -n "$NETEM_CMD" ]; then
-        apply_netem "$IFACE" $NETEM_CMD
-    fi
+   
 
     # Run server + clients
     start_server

@@ -1,74 +1,132 @@
-#!/bin/bash
-# Automated test runner for Multiplayer_Network
-IFACE="lo"
-SERVER_CMD="python3 ../server.py"
-CLIENT_CMD="python3 ../client.py"
-OUTDIR="./results"
-RUN_TIME=30
-NUM_CLIENTS=4
-SCENARIOS=("baseline" "loss2" "loss5" "delay100")
+#!/usr/bin/env bash
+set -euo pipefail
 
-mkdir -p "$OUTDIR"
+#############################################
+#  Multiplayer Game Automated Test Runner   #
+#  Runs all 4 network impairment scenarios  #
+#############################################
+
+### === CONFIGURATION === ###
+SERVER_PORT=5005
+SERVER_IP="127.0.0.1"
+NUM_CLIENTS=${1:-8}      # Number of headless test clients
+DURATION=${2:-30}        # Duration per scenario
+CLAIMS_PER_SEC=2         # Client send rate
+OUTDIR_BASE="results"
+
+### Directories ###
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # Project root (server.py location)
+
+### Colored output ###
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
+NC='\033[0m'  # No color
+
+#############################################
+### Helper Functions
+#############################################
 
 start_server() {
-    echo "[INFO] Starting server..."
-    $SERVER_CMD > server.log 2>&1 &
+    echo -e "${CYAN}[SERVER] Starting server (headless)...${NC}"
+    nohup python3 "$ROOT_DIR/server.py" --no-gui > "$OUTDIR/server.log" 2>&1 &
     SERVER_PID=$!
     sleep 1
+    echo -e "${GREEN}[SERVER] Running with PID $SERVER_PID${NC}"
+}
+
+stop_server() {
+    echo -e "${YELLOW}[SERVER] Stopping server...${NC}"
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
 }
 
 start_clients() {
-    echo "[INFO] Launching $NUM_CLIENTS clients..."
-    for i in $(seq 1 $NUM_CLIENTS); do
-        $CLIENT_CMD > client_${i}.log 2>&1 &
+    local prefix="$1"
+    echo -e "${CYAN}[CLIENTS] Launching $NUM_CLIENTS clients...${NC}"
+
+    for i in $(seq 1 "$NUM_CLIENTS"); do
+        nohup python3 "$SCRIPT_DIR/test_client.py" \
+            --server-ip "$SERVER_IP" \
+            --server-port "$SERVER_PORT" \
+            --duration "$DURATION" \
+            --send-rate "$CLAIMS_PER_SEC" \
+            --client-idx "$i" \
+            --out "$OUTDIR/${prefix}" \
+            > "$OUTDIR/${prefix}_client${i}.log" 2>&1 &
+        sleep 0.02
     done
 }
 
-stop_all() {
-    echo "[INFO] Stopping server and clients..."
-    taskkill //F //IM python.exe //T >nul 2>&1 || true
+### Network impairment helpers ###
+clear_netem() {
+    IFACE="$1"
+    sudo tc qdisc del dev "$IFACE" root 2>/dev/null || true
 }
 
 apply_netem() {
-    local scenario=$1
-    echo "[INFO] Applying netem profile: $scenario"
-    sudo tc qdisc del dev $IFACE root 2>/dev/null || true
-    case "$scenario" in
-        baseline) ;;
-        loss2) sudo tc qdisc add dev $IFACE root netem loss 2% ;;
-        loss5) sudo tc qdisc add dev $IFACE root netem loss 5% ;;
-        delay100) sudo tc qdisc add dev $IFACE root netem delay 100ms ;;
-    esac
+    IFACE="$1"
+    shift
+    echo -e "${YELLOW}[NETEM] Applying: $* on $IFACE${NC}"
+    clear_netem "$IFACE"
+    sudo tc qdisc add dev "$IFACE" root netem "$@"
 }
 
-capture_traffic() {
-    local scenario=$1
-    echo "[INFO] Capturing packets..."
-    sudo tcpdump -i $IFACE -w "$OUTDIR/${scenario}.pcap" udp port 5005 > /dev/null 2>&1 &
-    TCPDUMP_PID=$!
-}
+#############################################
+### Test Scenario Runner
+#############################################
 
-for scenario in "${SCENARIOS[@]}"; do
-    echo "======================================"
-    echo " Running Scenario: $scenario"
-    echo "======================================"
+scenario_runner() {
+    SCENARIO_NAME="$1"
+    NETEM_CMD="$2"
 
-    apply_netem "$scenario"
-    capture_traffic "$scenario"
+    OUTDIR="$ROOT_DIR/$OUTDIR_BASE/${SCENARIO_NAME}_$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$OUTDIR"
 
+    echo -e "\n${CYAN}=== Running Scenario: $SCENARIO_NAME ===${NC}"
+    echo "[OUTDIR] Logs and CSVs → $OUTDIR"
+
+    # Detect main interface
+    IFACE=${NETEM_IFACE:-$(ip route get 1.1.1.1 | awk '/dev/ {print $5}' | head -n1)}
+    echo "[NET] Using interface: $IFACE"
+
+    # Apply impairment
+    if [ -n "$NETEM_CMD" ]; then
+        apply_netem "$IFACE" $NETEM_CMD
+    fi
+
+    # Run server + clients
     start_server
-    start_clients
+    start_clients "$SCENARIO_NAME"
 
-    echo "[INFO] Running for $RUN_TIME seconds..."
-    sleep $RUN_TIME
+    echo "[WAIT] Running for $DURATION seconds..."
+    sleep "$DURATION"
 
-    stop_all
-    sudo kill $TCPDUMP_PID 2>/dev/null || true
-    sudo tc qdisc del dev $IFACE root 2>/dev/null || true
+    # Stop server
+    stop_server
 
-    echo "[INFO] Logs and PCAP saved for scenario: $scenario"
-    mkdir -p "$OUTDIR/$scenario"
-    mv ./*.log "$OUTDIR/$scenario"/
-done
+    # Reset network
+    if [ -n "$NETEM_CMD" ]; then
+        clear_netem "$IFACE"
+    fi
 
-echo "[DONE] All tests completed. Results stored in $OUTDIR/"
+    # Generate plots
+    echo "[PLOTS] Generating plots..."
+    python3 "$SCRIPT_DIR/generate_plots.py" "$OUTDIR" || true
+
+    echo -e "${GREEN}[DONE] Scenario '$SCENARIO_NAME' complete.${NC}"
+}
+
+#############################################
+### Run All Scenarios
+#############################################
+
+mkdir -p "$ROOT_DIR/$OUTDIR_BASE"
+
+scenario_runner "baseline" ""
+scenario_runner "loss_2" "loss 2%"
+scenario_runner "loss_5" "loss 5%"
+scenario_runner "delay_100ms" "delay 100ms 10ms distribution normal"
+
+echo -e "\n${GREEN}[ALL TESTS COMPLETED] Results stored in $OUTDIR_BASE.${NC}\n"

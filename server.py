@@ -436,7 +436,7 @@ class GameServer:
                         # Send latest snapshot so player sees current grid
                         self._send_snapshot()
                 else:
-                    if len(self.waiting_room_players) >= 1:
+                    if len(self.waiting_room_players) >= 2: #######
                         self._start_game()
 
             elif msg_type == MSG_TYPE_CLAIM_REQ:

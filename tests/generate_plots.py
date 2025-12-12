@@ -1,4 +1,3 @@
-# generate_plots.py
 import glob
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -22,44 +21,62 @@ def main(results_dir):
     all_df = load_all(pattern)
     if all_df is None:
         return
-    # parse time_ms to seconds (relative)
-    all_df['t_s'] = (all_df['time_ms'] - all_df['time_ms'].min())/1000.0
 
-    # Plot average RTT per second (averaged across clients)
-    df_rtt = all_df.groupby('t_s')['avg_rtt_ms'].mean().reset_index()
-    plt.figure()
-    plt.plot(df_rtt['t_s'], df_rtt['avg_rtt_ms'])
+    # FIX 1: Parse time_ms to seconds correctly (divide by 1000.0, not 100.0)
+    # Aligning start time to 0
+    start_time = all_df['time_ms'].min()
+    all_df['t_s'] = (all_df['time_ms'] - start_time) / 1000.0
+
+    # Get list of clients for iterating
+    clients = sorted(all_df['client_idx'].unique())
+
+    # --- PLOT 1: Average RTT over Time (Separate lines per client) ---
+    plt.figure(figsize=(10, 6))
+    for c in clients:
+        # Extract data for this client and sort by time
+        client_data = all_df[all_df['client_idx'] == c].sort_values('t_s')
+        plt.plot(client_data['t_s'], client_data['avg_rtt_ms'], label=f'Client {c}')
+    
     plt.xlabel("Time (s)")
     plt.ylabel("Average RTT (ms)")
-    plt.title("Average RTT over Time")
+    plt.title("Average RTT over Time (Per Client)")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
     plt.savefig(os.path.join(results_dir, "avg_rtt.png"))
 
-    # Snapshots received per client over time (sum across clients)
-    df_snap = all_df.groupby('t_s')['snapshots_received'].sum().reset_index()
-    plt.figure()
-    plt.plot(df_snap['t_s'], df_snap['snapshots_received'])
+    # --- PLOT 2: Snapshots received over time (Separate lines) ---
+    plt.figure(figsize=(10, 6))
+    for c in clients:
+        client_data = all_df[all_df['client_idx'] == c].sort_values('t_s')
+        plt.plot(client_data['t_s'], client_data['snapshots_received'], label=f'Client {c}')
+        
     plt.xlabel("Time (s)")
-    plt.ylabel("Snapshots received (sum across clients)")
-    plt.title("Snapshots received over time")
+    plt.ylabel("Snapshots Received (Cumulative)")
+    plt.title("Snapshots Received over Time")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
     plt.savefig(os.path.join(results_dir, "snapshots_over_time.png"))
 
-    # Retransmissions (sum)
-    df_retx = all_df.groupby('t_s')['retransmissions'].sum().reset_index()
-    plt.figure()
-    plt.plot(df_retx['t_s'], df_retx['retransmissions'])
+    # --- PLOT 3: Retransmissions over time (Separate lines) ---
+    plt.figure(figsize=(10, 6))
+    for c in clients:
+        client_data = all_df[all_df['client_idx'] == c].sort_values('t_s')
+        plt.plot(client_data['t_s'], client_data['retransmissions'], label=f'Client {c}')
+
     plt.xlabel("Time (s)")
-    plt.ylabel("Retransmissions (sum)")
-    plt.title("Retransmissions over time")
+    plt.ylabel("Retransmissions (Cumulative)")
+    plt.title("Retransmissions over Time")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
     plt.savefig(os.path.join(results_dir, "retransmissions.png"))
 
-    # Per-client summary
-    clients = all_df['client_idx'].unique()
+    # --- SUMMARY CSV & BAR PLOTS ---
     summary = []
     for c in clients:
-        sub = all_df[all_df['client_idx']==c]
+        sub = all_df[all_df['client_idx'] == c]
         summary.append({
             'client': c,
             'mean_rtt': sub['avg_rtt_ms'].mean(),
@@ -68,24 +85,26 @@ def main(results_dir):
         })
     s_df = pd.DataFrame(summary).sort_values('client')
     s_df.to_csv(os.path.join(results_dir, "summary_per_client.csv"), index=False)
-    # bar plots
+
+    # Bar Plot: Mean RTT
     plt.figure()
-    plt.bar(s_df['client'].astype(str), s_df['mean_rtt'])
+    plt.bar(s_df['client'].astype(str), s_df['mean_rtt'], color='skyblue', edgecolor='black')
     plt.xlabel("Client")
     plt.ylabel("Mean RTT (ms)")
     plt.title("Mean RTT per Client")
     plt.tight_layout()
     plt.savefig(os.path.join(results_dir, "mean_rtt_per_client.png"))
 
+    # Bar Plot: Snapshots
     plt.figure()
-    plt.bar(s_df['client'].astype(str), s_df['snapshots'])
+    plt.bar(s_df['client'].astype(str), s_df['snapshots'], color='lightgreen', edgecolor='black')
     plt.xlabel("Client")
-    plt.ylabel("Snapshots received")
-    plt.title("Snapshots received per Client")
+    plt.ylabel("Total Snapshots")
+    plt.title("Total Snapshots Received per Client")
     plt.tight_layout()
     plt.savefig(os.path.join(results_dir, "snapshots_per_client.png"))
 
-    print("Plots and summary saved to", results_dir)
+    print(f"Plots and summary saved to: {results_dir}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

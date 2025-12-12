@@ -1,4 +1,6 @@
 # test_client.py
+import os
+import sys
 import argparse
 import socket
 import struct
@@ -6,16 +8,23 @@ import time
 import threading
 import random
 import csv
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
 from protocol import (
-    create_header, parse_header, create_ack_packet,
+    parse_packet, create_packet, create_ack_packet,
     MSG_TYPE_JOIN_REQ, MSG_TYPE_JOIN_RESP, MSG_TYPE_CLAIM_REQ,
-    MSG_TYPE_BOARD_SNAPSHOT, MSG_TYPE_ACK, HEADER_SIZE
+    MSG_TYPE_BOARD_SNAPSHOT, MSG_TYPE_ACK, MSG_TYPE_GAME_START, MSG_TYPE_GAME_OVER,
+    HEADER_SIZE
 )
 
 def current_time_ms():
     return int(time.time() * 1000)
 
+
 class HeadlessClient:
+
     def __init__(self, server_ip, server_port, duration, send_rate, client_idx, out_prefix):
         self.server_ip = server_ip
         self.server_port = server_port
@@ -42,46 +51,54 @@ class HeadlessClient:
         self.snapshots_received = 0
 
         self.player_id = None
-        self.last_ack_received = None
+        self.last_ack_received_from_server = 0
 
+        self.start_time = time.time()
         # thread sync
         self.lock = threading.Lock()
 
     def start(self):
         self.running = True
         threading.Thread(target=self._receive_loop, daemon=True).start()
+
         # send join
         self._sr_send(MSG_TYPE_JOIN_REQ, b'')
+
         # start claim sender
         threading.Thread(target=self._claim_loop, daemon=True).start()
+
         # start retransmit timer thread
         threading.Thread(target=self._retransmit_loop, daemon=True).start()
-
+        
         # log to CSV
         csv_path = f"{self.out_prefix}_client{self.client_idx}.csv"
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["time_ms","sent","received","retransmissions","avg_rtt_ms","snapshots_received","client_idx"])
-            start = time.time()
-            while time.time() - start < self.duration and self.running:
-                with self.lock:
-                    avg_rtt = int(sum(self.sample_rtts)/len(self.sample_rtts)) if self.sample_rtts else 0
-                    row = [current_time_ms(), self.sent, self.received, self.retransmissions, avg_rtt, self.snapshots_received, self.client_idx]
-                writer.writerow(row)
-                f.flush()
-                time.sleep(1)
-        self.running = False
-        self.sock.close()
+            
+            try:
+                while time.time() - self.start_time < self.duration and self.running:
+                    with self.lock:
+                        avg_rtt = int(sum(self.sample_rtts)/len(self.sample_rtts)) if self.sample_rtts else 0
+                        row = [current_time_ms(), self.sent, self.received, self.retransmissions, avg_rtt, self.snapshots_received, self.client_idx]
+                    writer.writerow(row)
+                    f.flush()
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                self.running = False
+                self.sock.close()
 
     def _sr_send(self, msg_type, payload=b''):
         seq = self.next_seq
-        header = create_header(msg_type, seq, len(payload))
-        packet = header + payload
         try:
+            packet = create_packet(msg_type, seq, payload, ack_num=self.last_ack_received_from_server)
             self.sock.sendto(packet, (self.server_ip, self.server_port))
         except Exception as e:
             self.dropped += 1
             return False
+           
         with self.lock:
             self.window[seq] = packet
             self.send_timestamp[seq] = current_time_ms()
@@ -91,7 +108,7 @@ class HeadlessClient:
 
     def _retransmit_loop(self):
         RTO = 500  # ms
-        while self.running:
+        while self.running and time.time() - self.start_time < self.duration:
             now = current_time_ms()
             to_retx = []
             with self.lock:
@@ -102,26 +119,24 @@ class HeadlessClient:
                 pkt = None
                 with self.lock:
                     pkt = self.window.get(seq)
-                if pkt is None:
-                    continue
-                try:
-                    self.sock.sendto(pkt, (self.server_ip, self.server_port))
-                    with self.lock:
+                if pkt:
+                    try:
+                        self.sock.sendto(pkt, (self.server_ip, self.server_port))
                         self.retransmissions += 1
                         self.send_timestamp[seq] = current_time_ms()
-                except:
-                    pass
+                    except:
+                        pass
             time.sleep(0.05)
 
     def _claim_loop(self):
         interval = 1.0 / max(1, self.send_rate)
-        while self.running:
+        while self.running and time.time() - self.start_time < self.duration - 1:
             if self.player_id is not None:
                 # random row/col
                 r = random.randint(0, 19)
                 c = random.randint(0, 19)
                 # ack_num (optional) 0 for headless clients
-                payload = struct.pack("!BBH", r, c, 0)
+                payload = struct.pack("!BBH", r, c, self.last_ack_received_from_server)
                 self._sr_send(MSG_TYPE_CLAIM_REQ, payload)
             time.sleep(interval)
 
@@ -133,33 +148,47 @@ class HeadlessClient:
                 continue
             except Exception:
                 break
-            if len(data) < HEADER_SIZE:
+
+            # 1 Parse Packet
+            header, payload, valid = parse_packet(data)
+            if not valid or not header:
                 continue
-            header = parse_header(data[:HEADER_SIZE])
+
             msg_type = header['msg_type']
             seq = header['seq_num']
+            ack_n = header.get('ack_num', 0)  # <--- DEFINE THIS EARLY
+
+            # 2 Update Piggyback Tracker
+            self.last_ack_received_from_server = seq
+
+            # 3 Send Immediate ACK
+            try:
+                ack_packet = create_ack_packet(ack_num=seq)
+                self.sock.sendto(ack_packet, addr)
+            except:
+                pass
+
             with self.lock:
                 self.received += 1
-            # If ACK -> compute RTT if we have timestamp
-            if msg_type == MSG_TYPE_ACK:
-                ack_n = header.get('ack_num', 0)
-                with self.lock:
+
+            # 4 Process the ACK we received
+            with self.lock:
+                if ack_n in self.window:
                     ts = self.send_timestamp.pop(ack_n, None)
                     if ts:
                         rtt = current_time_ms() - ts
                         self.sample_rtts.append(rtt)
-                        # remove from window as acked
-                        if ack_n in self.window:
-                            del self.window[ack_n]
-            elif msg_type == MSG_TYPE_JOIN_RESP:
-                # payload contains player id
-                payload = data[HEADER_SIZE:]
+                    del self.window[ack_n]    
+
+            # 5 Handle Game Logic (Join/Snapshot)
+            if msg_type == MSG_TYPE_JOIN_RESP:
                 if len(payload) >= 1:
                     pid = struct.unpack("!B", payload[:1])[0]
                     self.player_id = pid
+           
             elif msg_type == MSG_TYPE_BOARD_SNAPSHOT:
                 self.snapshots_received += 1
-            # continue loop
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()

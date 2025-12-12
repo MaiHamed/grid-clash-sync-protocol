@@ -87,8 +87,8 @@ def main():
 
     all_rows = []
 
-    # Recursively find all .txt and .log files
-    log_files = list(results_dir.rglob("*.txt")) + list(results_dir.rglob("*.log"))
+    # Recursively find all .log files
+    log_files = list(results_dir.rglob("*.log"))
     if not log_files:
         print(f"[ERROR] No log files found under {results_dir}")
         return
@@ -128,7 +128,7 @@ def main():
         ]
     ]
     summary_df.to_csv(summary_csv, index=False)
-    print(f"\n✅ Summary written to {summary_csv}")
+    print(f"\n Summary written to {summary_csv}")
     print(summary_df)
 
 

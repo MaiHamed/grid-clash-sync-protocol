@@ -3,34 +3,49 @@ set -euo pipefail
 
 #############################################
 #  Multiplayer Game Automated Test Runner   #
-#  Runs all 4 network impairment scenarios #
-#  Windows / Git Bash compatible           #
+#  Linux Version - Uses 'tc' for Impairment #
 #############################################
 
 ### === CONFIGURATION === ###
 SERVER_PORT=5005
 SERVER_IP="127.0.0.1"
-NUM_CLIENTS=${1:-4}      # Number of headless test clients
-DURATION=${2:-30}         # Duration per scenario
-CLAIMS_PER_SEC=2          # Client send rate
+NUM_CLIENTS=${1:-4}       # Default to 4 clients if not provided
+DURATION=${2:-30}         # Default to 30 seconds per test
+CLAIMS_PER_SEC=20
 OUTDIR_BASE="results"
+IFACE="lo"                # Loopback interface (since we use 127.0.0.1)
 
 ### Directories ###
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # Project root (server.py location)
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-### Colored output ###
+### Colors ###
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
-NC='\033[0m'  # No color
+RED='\033[0;31m'
+NC='\033[0m'
 
 #############################################
 ### Helper Functions
 #############################################
 
+# Safety Cleanup: Ensures we don't leave the network lagging if script crashes
+cleanup() {
+    echo -e "\n${YELLOW}[CLEANUP] Resetting network and killing processes...${NC}"
+    # Stop Python processes
+    pkill -f "server.py" || true
+    pkill -f "test_client.py" || true
+    
+    # Reset Network (sudo required)
+    if sudo tc qdisc show dev "$IFACE" | grep -q "netem"; then
+        sudo tc qdisc del dev "$IFACE" root 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
 start_server() {
-    echo -e "${CYAN}[SERVER] Starting server (headless)...${NC}"
+    echo -e "${CYAN}[SERVER] Starting server...${NC}"
     mkdir -p "$OUTDIR"
     nohup python3 "$ROOT_DIR/server.py" --no-gui > "$OUTDIR/server.log" 2>&1 &
     SERVER_PID=$!
@@ -40,7 +55,7 @@ start_server() {
 
 stop_server() {
     echo -e "${YELLOW}[SERVER] Stopping server...${NC}"
-    if [ -n "${SERVER_PID-}" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    if [ -n "${SERVER_PID-}" ]; then
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
@@ -61,7 +76,7 @@ start_clients() {
             --client-idx "$i" \
             --out "$OUTDIR/$prefix" \
             > "$OUTDIR/${prefix}_client${i}.log" 2>&1 &
-        sleep 0.02
+        sleep 0.05
     done
 }
 
@@ -76,41 +91,68 @@ scenario_runner() {
     OUTDIR="$ROOT_DIR/$OUTDIR_BASE/${SCENARIO_NAME}_$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$OUTDIR"
 
-    echo -e "\n${CYAN}=== Running Scenario: $SCENARIO_NAME ===${NC}"
-    echo "[OUTDIR] Logs and CSVs → $OUTDIR"
+    echo -e "\n${CYAN}==========================================${NC}"
+    echo -e "${CYAN}   Running Scenario: $SCENARIO_NAME${NC}"
+    echo -e "${CYAN}==========================================${NC}"
 
-    # Skip network detection and impairment on Windows
-    IFACE="lo"
-    echo "[NET] Using interface: $IFACE (network impairment skipped on Windows)"
+    # 1. Clear any previous network rules first
+    sudo tc qdisc del dev "$IFACE" root 2>/dev/null || true
 
-    # Run server + clients
+    # 2. Apply Network Impairment (if any)
+    if [ -n "$NETEM_CMD" ]; then
+        echo -e "${RED}[NET] Applying: $NETEM_CMD on $IFACE${NC}"
+        # We use 'add' because we cleared root above
+        sudo tc qdisc add dev "$IFACE" root netem $NETEM_CMD
+    else
+        echo -e "${GREEN}[NET] No impairment (Baseline)${NC}"
+    fi
+
+    # 3. Run Test
     start_server
     start_clients "$SCENARIO_NAME"
 
     echo "[WAIT] Running for $DURATION seconds..."
     sleep "$DURATION"
 
-    # Stop server
     stop_server
 
-    # Skip network reset (Linux-only tc commands)
+    # 4. Reset Network Immediately after test
+    if [ -n "$NETEM_CMD" ]; then
+        echo "[NET] Resetting network rules..."
+        sudo tc qdisc del dev "$IFACE" root 2>/dev/null || true
+    fi
 
-    # Generate plots
-    echo "[PLOTS] Generating plots..."
-    python3 "$SCRIPT_DIR/generate_plots.py" "$OUTDIR" || true
+    # 5. Generate Plots (Optional - remove if not needed yet)
+    if [ -f "$SCRIPT_DIR/generate_plots.py" ]; then
+        echo "[PLOTS] Generating plots..."
+        python3 "$SCRIPT_DIR/generate_plots.py" "$OUTDIR" || true
+    fi
 
     echo -e "${GREEN}[DONE] Scenario '$SCENARIO_NAME' complete.${NC}"
 }
 
 #############################################
-### Run All Scenarios
+### Main Execution
 #############################################
+
+# Ensure script is run with permission to use sudo
+if ! sudo -v; then
+    echo -e "${RED}Error: This script requires sudo privileges to run 'tc' commands.${NC}"
+    exit 1
+fi
 
 mkdir -p "$ROOT_DIR/$OUTDIR_BASE"
 
+# Scenario 1: Baseline (No Lag)
 scenario_runner "baseline" ""
+
+# Scenario 2: 2% Packet Loss
 scenario_runner "loss_2" "loss 2%"
+
+# Scenario 3: 5% Packet Loss
 scenario_runner "loss_5" "loss 5%"
+
+# Scenario 4: High Latency (100ms ± 10ms jitter)
 scenario_runner "delay_100ms" "delay 100ms 10ms distribution normal"
 
 echo -e "\n${GREEN}[ALL TESTS COMPLETED] Results stored in $OUTDIR_BASE.${NC}\n"

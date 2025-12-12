@@ -3,6 +3,12 @@ import struct
 import time
 import select
 import threading
+import csv
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 from gui import GameGUI
 from protocol import (
     MSG_TYPE_LEADERBOARD, create_ack_packet, create_packet, pack_grid_snapshot, pack_leaderboard_data, parse_packet,
@@ -26,9 +32,10 @@ def calculate_scores_from_grid(grid):
 
 
 class GameServer:
-    def __init__(self, ip="127.0.0.1", port=5005):
+    def __init__(self, ip="127.0.0.1", port=5005, metrics_file_path="server_metrics.csv"):
         self.ip = ip
         self.port = port
+        self.metrics_file_path = metrics_file_path
 
         # Sockets & networking
         self.server_socket = None
@@ -63,6 +70,15 @@ class GameServer:
 
         # Statistics
         self.stats = {'sent': 0, 'received': 0, 'dropped': 0, 'client_count': 0}
+        
+        # Bandwidth Tracking
+        self.client_bytes_sent = {} # pid -> total_bytes
+        self.client_join_time = {}  # pid -> start_time
+        
+        # Metrics Logging
+        self.metrics_file = None
+        self.metrics_writer = None
+
 
         # For late joiners (snapshot history)
         self.recent_snapshots = []
@@ -109,7 +125,19 @@ class GameServer:
             # Start server loop thread
             threading.Thread(target=self._server_loop, daemon=True).start()
 
+            # Open metrics file
+            try:
+                self.metrics_file = open(self.metrics_file_path, "w", newline="")
+                self.metrics_writer = csv.writer(self.metrics_file, delimiter=" ")
+                # Write header compatible with postprocess.py
+                self.metrics_writer.writerow(["client_id", "snapshot_id", "seq_num", "server_timestamp_ms", "recv_time_ms", "cpu_percent", "perceived_position_error", "bandwidth_per_client_kbps"])
+                self.metrics_file.flush()
+                print(f"[INFO] Logging metrics to {self.metrics_file_path}")
+            except Exception as e:
+                print(f"[ERROR] Failed to open metrics file: {e}")
+
             print(f"[INFO] Server started at {self.ip}:{self.port}")
+
             self.gui.log_message(f"Server started on {self.ip}:{self.port}", "success")
             self.gui.update_player_info("Server", True)
             self.stats['client_count'] = len(self.clients) + len(self.waiting_room_players)
@@ -128,7 +156,18 @@ class GameServer:
                 self.server_socket.close()
             except Exception:
                 pass
+            except Exception:
+                pass
             self.server_socket = None
+
+        if self.metrics_file:
+            try:
+                self.metrics_file.close()
+            except:
+                pass
+            self.metrics_file = None
+            self.metrics_writer = None
+
 
         # Clear state
         self.clients.clear()
@@ -170,6 +209,11 @@ class GameServer:
             self.client_rtt[player_id] = {'est': 100, 'dev': 50, 'rto': 1000}
             self.client_send_ts[player_id] = {}
             self.client_retrans[player_id] = set()
+
+            # Init bandwidth tracking
+            self.client_bytes_sent[player_id] = 0
+            self.client_join_time[player_id] = time.time()
+
 
         next_seq = self.client_next_seq[player_id]
         base = self.client_base[player_id]
@@ -227,6 +271,10 @@ class GameServer:
         # Send
         try:
             self.server_socket.sendto(packet, addr)
+
+            # Track bandwidth
+            if player_id in self.client_bytes_sent:
+                self.client_bytes_sent[player_id] += len(packet)
 
             # Store packet in window
             window[next_seq] = packet
@@ -668,6 +716,33 @@ class GameServer:
                 
                 print(f"[RTT] PID={player_id} sample={sample_rtt}ms RTO={stats['rto']:.2f}ms")
 
+            # LOGGING FOR POSTPROCESS.PY (File Output)
+            if self.metrics_writer:
+                cpu = psutil.cpu_percent() if psutil else 0.0
+                current_ts = current_time_ms()
+                
+                # Bandwidth calc
+                total_bytes = self.client_bytes_sent.get(player_id, 0)
+                start_time = self.client_join_time.get(player_id, time.time())
+                duration = max(0.001, time.time() - start_time)
+                bw_kbps = (total_bytes * 8 / 1000) / duration
+
+                # Ensure cpu is a scalar val
+                cpu_val = cpu[0] if isinstance(cpu, tuple) else cpu
+                
+                self.metrics_writer.writerow([
+                    player_id, 
+                    0, 
+                    ack_num, 
+                    send_ts, 
+                    current_ts, 
+                    cpu_val, 
+                    0.0, # perceived_position_error
+                    bw_kbps
+                ])
+                self.metrics_file.flush()
+
+
             # Cleanup RTT tracking
             if player_id in self.client_send_ts:
                 self.client_send_ts[player_id].pop(ack_num, None)
@@ -966,11 +1041,21 @@ class GameServer:
 
 
 # Main execution
+# Main execution
 if __name__ == "__main__":
+    import argparse
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--no-gui":
-        server = GameServer()
+    parser = argparse.ArgumentParser(description="Multiplayer Game Server")
+    parser.add_argument("--ip", default="127.0.0.1", help="Server IP to bind to")
+    parser.add_argument("--port", type=int, default=5005, help="Server Port")
+    parser.add_argument("--no-gui", action="store_true", help="Run in headless mode (no GUI)")
+    parser.add_argument("--metrics-file", default="server_metrics.csv", help="Path to CSV metrics file")
+    
+    args = parser.parse_args()
+
+    if args.no_gui:
+        server = GameServer(ip=args.ip, port=args.port, metrics_file_path=args.metrics_file)
         server.start()
         try:
             while True:
@@ -978,5 +1063,5 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             server.stop()
     else:
-        server = GameServer()
+        server = GameServer(ip=args.ip, port=args.port, metrics_file_path=args.metrics_file)
         server.start_gui()

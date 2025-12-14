@@ -2,6 +2,7 @@ import socket
 import struct
 import time
 import select
+import os
 import threading
 import csv
 try:
@@ -57,8 +58,11 @@ class GameServer:
         self.running = False
         self.grid_changed = False
         self._should_send_snapshots = False  # Control flag for snapshots
-        self.game_duration = 60  # 60 seconds game duration
+        self.game_duration = 60  # 60 seconds game duration for stealing mode
         self.game_start_time = None
+        self.stealing_enabled = self._load_stealing_setting()
+        self.total_cells = 20 * 20
+        self.claimed_cells_count = 0  # Track claimed cells for non-stealing mode
 
         # leaderboard data storage
         self.final_scores = []
@@ -156,8 +160,6 @@ class GameServer:
                 self.server_socket.close()
             except Exception:
                 pass
-            except Exception:
-                pass
             self.server_socket = None
 
         if self.metrics_file:
@@ -201,7 +203,6 @@ class GameServer:
         if player_id not in self.client_next_seq:
             self.client_next_seq[player_id] = 0      # nextSeqNum
             self.client_base[player_id] = 0          # base
-            self.client_windows[player_id] = {}      # seq → packet
             self.client_windows[player_id] = {}      # seq → packet
             self.client_timers[player_id] = {}       # seq → timestamp
             
@@ -427,8 +428,6 @@ class GameServer:
             # Send ACK for reliability (ack the received seq)
             try:
                 ack_packet = create_ack_packet(ack_num=seq)
-                # Use server_socket (fixed bug from earlier version)
-                #self.server_socket.sendto(ack_packet, addr)  #####
                 print(f"[SEND ACK] seq={seq}, to={addr}")
             except Exception as e:
                 print(f"[ERROR] sending ACK to {addr}: {e}")
@@ -464,15 +463,7 @@ class GameServer:
 
                 # If game is active and we have less than 4 active players, move waiting player in
                 if self.game_active:
-                    if len(self.clients) < 4:
-                        # Reset all existing players' windows to prevent blocking
-                        #for pid in list(self.clients.keys()):
-                           # if pid in self.client_windows:
-                               # self.client_windows[pid].clear()
-                               # self.client_timers[pid].clear()
-                                #self.client_next_seq[pid] = 0
-                                #self.client_base[pid] = 0      
-                        
+                    if len(self.clients) < 4:                      
                         # NOW add the new player to active game
                         self.clients[new_pid] = (addr, time.time())
                         del self.waiting_room_players[new_pid]
@@ -484,12 +475,15 @@ class GameServer:
                         # Send latest snapshot so player sees current grid
                         self._send_snapshot()
                 else:
-                    if len(self.waiting_room_players) >= 2: #######
+                    if len(self.waiting_room_players) >= self.min_players:
                         self._start_game()
 
             elif msg_type == MSG_TYPE_CLAIM_REQ:
                 player_id = self._addr_to_pid(addr)
-                self.server_socket.sendto(ack_packet, addr) #####
+                try:
+                    self.server_socket.sendto(ack_packet, addr)
+                except:
+                    pass
                 if player_id:
                     # Payload is now returned by parse_packet
                     pay = payload if len(payload) >= 4 else b''
@@ -500,7 +494,22 @@ class GameServer:
                         self._handle_ack(player_id, client_ack_num)
 
                         if 0 <= r < 20 and 0 <= c < 20:
-
+                            # Check stealing setting
+                            current_owner = self.grid_state[r][c]
+                            
+                            if not self.stealing_enabled:
+                                # STEALING DISABLED: Check if cell is already claimed
+                                if current_owner != 0:
+                                    # Cell is already owned, reject the claim
+                                    self.gui.log_message(
+                                        f"Player {player_id} attempted to steal cell ({r},{c}) from Player {current_owner} - REJECTED",
+                                        "warning"
+                                    )
+                                    # Still update last_seen time for the player
+                                    if player_id in self.clients:
+                                        self.clients[player_id] = (addr, time.time())
+                                    return
+                            
                             # --- TIMESTAMP FIX STARTS HERE ---
                             claim_time = header.get("timestamp", 0)
 
@@ -510,24 +519,38 @@ class GameServer:
 
                             # Accept only newer claims
                             if claim_time > self.grid_claim_time[r][c]:
-
-                                old_owner = self.grid_state[r][c]
-
+                                old_owner = current_owner
+                                
+                                # Track claimed cells count for non-stealing mode
+                                if old_owner == 0:
+                                    self.claimed_cells_count += 1
+                                    print(f"[GRID] Cells claimed: {self.claimed_cells_count}/{self.total_cells}")
+                                
                                 # Update grid & timestamp
                                 self.grid_state[r][c] = player_id
                                 self.grid_claim_time[r][c] = claim_time
                                 self.grid_changed = True
 
-                                # Logging
+                                # Logging based on stealing setting
                                 if old_owner == 0:
                                     self.gui.log_message(
                                         f"Player {player_id} claimed cell ({r},{c})",
                                         "info"
                                     )
-                                else:
+                                    # Check if all cells are claimed (for non-stealing mode)
+                                    if not self.stealing_enabled and self.claimed_cells_count >= self.total_cells:
+                                        self.gui.log_message("🎉 ALL CELLS CLAIMED! Game ending...", "success")
+                                        self._end_game_with_scores()
+                                elif self.stealing_enabled:
                                     self.gui.log_message(
                                         f"Player {player_id} stole cell ({r},{c}) from Player {old_owner}",
                                         "warning"
+                                    )
+                                else:
+                                    # This shouldn't happen with stealing disabled, but just in case
+                                    self.gui.log_message(
+                                        f"Player {player_id} claimed cell ({r},{c}) (was Player {old_owner})",
+                                        "info"
                                     )
 
                                 # Update GUI
@@ -553,7 +576,7 @@ class GameServer:
 
                 else:
                     self.gui.log_message(f"Claim from unknown addr {addr}", "warning")
-            
+                        
             elif msg_type == MSG_TYPE_LEAVE:
                 # ACK the LEAVE message
                 client_seq = header['seq_num']
@@ -597,6 +620,21 @@ class GameServer:
             self.gui.log_message(f"Message handling error: {e}", "error")
 
     # ==================== Helper ====================
+    def _load_stealing_setting(self):
+        """Load stealing setting from file"""
+        try:
+            if os.path.exists("game_settings.txt"):
+                with open("game_settings.txt", "r") as f:
+                    content = f.read()
+                    if "stealing_enabled=1" in content:
+                        print("[SERVER] Stealing mode enabled from file")
+                        return True
+        except Exception as e:
+            print(f"[SERVER] Error loading settings: {e}")
+        
+        print("[SERVER] Stealing mode disabled (default)")
+        return False
+    
     def _addr_to_pid(self, addr):
         """Return pid for an address (search active clients then waiting room)."""
         for pid, (client_addr, _) in self.clients.items():
@@ -622,6 +660,9 @@ class GameServer:
                         self.grid_state[r][c] = 0  # Reset to unclaimed
                         self.grid_claim_time[r][c] = 0  # Reset timestamp
                         cells_removed += 1
+        
+        # Update claimed cells count for non-stealing mode
+        self.claimed_cells_count = max(0, self.claimed_cells_count - cells_removed)
         
         # Remove player from all data structures
         self.clients.pop(player_id, None)
@@ -656,6 +697,7 @@ class GameServer:
             # Reset grid when all players have left
             self.grid_state = [[0] * 20 for _ in range(20)]
             self.grid_claim_time = [[0] * 20 for _ in range(20)]
+            self.claimed_cells_count = 0
             self.grid_changed = True  # This will trigger a snapshot if new players join
             
             # Update GUI to show empty grid
@@ -810,23 +852,37 @@ class GameServer:
     # ==================== Start / End Game ====================
     
     def _game_timer_thread(self):
-        """Background thread to manage game duration"""
+        """Background thread to manage game duration (only for stealing mode)"""
         while self.running:
             if self.game_active and self.game_start_time:
-                elapsed = time.time() - self.game_start_time
-                if elapsed >= self.game_duration:
+                if self.stealing_enabled:
+                    # Stealing mode: check timer
+                    elapsed = time.time() - self.game_start_time
+                    if elapsed >= self.game_duration:
+                        self._end_game_with_scores()
+                        self.game_start_time = None
+                    elif self.game_duration - elapsed <= 10:
+                        # Send warning when 10 seconds remaining
+                        if int(self.game_duration - elapsed) == 10:
+                            self.gui.log_message("10 seconds remaining!", "warning")
+                # For non-stealing mode, we check claimed cells in handle_claim_req
+                
+                # Also check if game should end due to insufficient players
+                active_players = len(self.clients)
+                if active_players < self.min_players:
+                    self.gui.log_message(f"Less than {self.min_players} players remaining. Ending game...", "warning")
                     self._end_game_with_scores()
                     self.game_start_time = None
-                elif self.game_duration - elapsed <= 10:
-                    # Send warning when 10 seconds remaining
-                    if int(self.game_duration - elapsed) == 10:
-                        self.gui.log_message("10 seconds remaining!", "warning")
+                    
             time.sleep(1)
     
     def _start_game(self):
         self.game_active = True
         self._should_send_snapshots = True
         self.game_start_time = time.time()  # Track when game started
+        
+        # Reset claimed cells count
+        self.claimed_cells_count = 0
         
         # Convert waiting_room_players (pid->addr) to clients structure (pid->(addr, last_seen))
         for pid, addr in self.waiting_room_players.items():
@@ -835,7 +891,15 @@ class GameServer:
 
         # Update stats & GUI
         self.stats['client_count'] = len(self.clients)
-        self.gui.log_message(f"Game started with {len(self.clients)} players! (Duration: {self.game_duration}s)", "success")
+        
+        # Show game mode in log
+        if self.stealing_enabled:
+            self.gui.log_message(f"Game started with {len(self.clients)} players! (Stealing Mode - 60s timer)", "success")
+            self.gui.log_message("Players can steal cells from each other", "info")
+        else:
+            self.gui.log_message(f"Game started with {len(self.clients)} players! (Non-Stealing Mode)", "success")
+            self.gui.log_message("Game ends when all 400 cells are claimed", "info")
+            
         self.gui.log_message("Players: " + ", ".join([f"Player {pid}" for pid in self.clients.keys()]), "info")
         self.gui.update_players(self.clients)
         self.gui.update_stats(self.stats)
@@ -892,7 +956,10 @@ class GameServer:
         
         # Update server GUI with final scores
         score_str = ", ".join([f"Player {pid}: {score}" for pid, score in self.final_scores])
-        self.gui.log_message(f"Game Over! Final scores: {score_str}", "info")
+        if self.stealing_enabled:
+            self.gui.log_message(f"Game Over! Time's up! Final scores: {score_str}", "info")
+        else:
+            self.gui.log_message(f"Game Over! All cells claimed! Final scores: {score_str}", "info")
         
         # Show leaderboard on server
         self._show_server_leaderboard()
@@ -949,6 +1016,7 @@ class GameServer:
         # Reset grid
         self.grid_state = [[0] * 20 for _ in range(20)]
         self.grid_claim_time = [[0] * 20 for _ in range(20)]
+        self.claimed_cells_count = 0
         self.grid_changed = False
         
         # Reset game state
@@ -1004,6 +1072,7 @@ class GameServer:
             # Clear game state
             self.grid_state = [[0] * 20 for _ in range(20)]
             self.grid_claim_time = [[0] * 20 for _ in range(20)]
+            self.claimed_cells_count = 0
             self.grid_changed = False
             
             print("[GAME OVER]")
@@ -1040,7 +1109,6 @@ class GameServer:
                 self.stop()
 
 
-# Main execution
 # Main execution
 if __name__ == "__main__":
     import argparse

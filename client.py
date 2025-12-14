@@ -50,7 +50,8 @@ class GameClient:
         self.game_active = False
         self.waiting_for_game = True
         self.game_start_time = None
-        self.game_duration = 100
+        self.stealing_enabled = self._load_stealing_setting()
+        self.game_duration = 60 if self.stealing_enabled else 9999  # Long time for non-stealing
         self._game_over_handled = False
         self.final_scores = []
 
@@ -79,6 +80,28 @@ class GameClient:
         self.gui.log_message("Waiting for game to start...", "info")
         self.gui.update_player_info("Waiting...", True)
 
+    def _load_stealing_setting(self):
+        """Load stealing setting from environment or file"""
+        # Try environment variable first (set by waiting room)
+        stealing_env = os.environ.get("STEALING_ENABLED", "0")
+        if stealing_env == "1":
+            print("[CLIENT] Stealing mode enabled from environment")
+            return True
+        
+        # Try to read from settings file
+        try:
+            if os.path.exists("game_settings.txt"):
+                with open("game_settings.txt", "r") as f:
+                    content = f.read()
+                    if "stealing_enabled=1" in content:
+                        print("[CLIENT] Stealing mode enabled from file")
+                        return True
+        except:
+            pass
+        
+        print("[CLIENT] Stealing mode disabled (default)")
+        return False
+    
     def on_cell_click(self, row, col):
         if not self.player_id:
             self.gui.log_message("Not connected to server", "error")
@@ -88,14 +111,18 @@ class GameClient:
             return
         
         current_owner = self.local_grid[row][col]
-        # Check if cell is already claimed (by anyone)
-        if self.local_grid[row][col] != 0:
-            self.gui.log_message(f"Attempting to steal cell ({row},{col}) from Player {current_owner}...", "info")
-            #return
         
-        #if current_owner == self.player_id:
-         #   self.gui.log_message(f"You already own cell ({row},{col})!", "warning")
-          #  return
+        # Check stealing setting
+        if not self.stealing_enabled:
+            # STEALING DISABLED: Check if cell is already claimed by ANY player
+            if current_owner != 0:
+                self.gui.log_message(f"Cell ({row},{col}) is already owned by Player {current_owner}. Cannot steal!", "warning")
+                return
+        else:
+            # STEALING ENABLED: Only prevent claiming your own cells
+            if current_owner == self.player_id:
+                self.gui.log_message(f"You already own cell ({row},{col})!", "warning")
+                return
         
         # OPTIMISTIC UPDATE: Immediately update local grid and GUI with player color
         self.local_grid[row][col] = self.player_id
@@ -109,10 +136,9 @@ class GameClient:
             self.gui.log_message(f"Request to claim ({row},{col}) sent.", "claim")
         else:
             # If send failed, revert the optimistic update
-            self.local_grid[row][col] = current_owner # revert to past owner not 0 !!!
+            self.local_grid[row][col] = current_owner  # Revert to previous owner
             self.claimed_cells.discard((row, col))
             self.gui.update_grid(self.local_grid)
-
     # ==================== SR ARQ SENDER ====================
     def _sr_send(self, msg_type, payload=b''):
         if self.nextSeqNum < self.base + self.N:
@@ -387,7 +413,13 @@ class GameClient:
             self.game_active = True
             self.waiting_for_game = False
             self.game_start_time = time.time()
-            self.gui.log_message("GAME STARTED! 🎮", "success")
+            
+            # Show game mode message
+            if self.stealing_enabled:
+                self.gui.log_message("GAME STARTED! 🎮 (Stealing Mode - 60 second timer)", "success")
+            else:
+                self.gui.log_message("GAME STARTED! 🎮 (Non-Stealing Mode - Ends when all cells claimed)", "success")
+                
             self.gui.update_player_info(f"Player {self.player_id} (Playing)", True)
             self._start_game_timer()
         
@@ -510,20 +542,36 @@ class GameClient:
             return
 
         elapsed = time.time() - self.game_start_time
-        remaining = max(0, self.game_duration - elapsed)
-        minutes, seconds = divmod(int(remaining), 60)
-        self.gui.root.title(f"Grid Game Client - Time: {minutes:02d}:{seconds:02d}")
-
-        if remaining <= 0:
-            # Stop timer and trigger game over
-            if self.game_timer_id:
-                self.gui.root.after_cancel(self.game_timer_id)
-                self.game_timer_id = None
-            # Trigger game over safely
-            self.gui.root.after(0, self._handle_game_over)
-            return
-
-        # Continue countdown
+        
+        if self.stealing_enabled:
+            # Show countdown timer for stealing mode
+            remaining = max(0, self.game_duration - elapsed)
+            minutes, seconds = divmod(int(remaining), 60)
+            
+            if remaining <= 0:
+                # Stop timer and trigger game over
+                if self.game_timer_id:
+                    self.gui.root.after_cancel(self.game_timer_id)
+                    self.game_timer_id = None
+                # Trigger game over safely
+                self.gui.root.after(0, self._handle_game_over)
+                return
+            
+            # Update window title with timer
+            self.gui.root.title(f"Grid Game Client - Time: {minutes:02d}:{seconds:02d}")
+            
+            # Show warning when 10 seconds remaining
+            if remaining <= 10:
+                if int(remaining) == 10:
+                    self.gui.log_message(f"{int(remaining)} seconds remaining!", "warning")
+        else:
+            # For non-stealing mode, show elapsed time instead of countdown
+            minutes, seconds = divmod(int(elapsed), 60)
+            self.gui.root.title(f"Grid Game Client - Elapsed: {minutes:02d}:{seconds:02d}")
+            
+            # Don't end game locally for non-stealing mode - wait for server
+        
+        # Continue timer
         self.game_timer_id = self.gui.root.after(1000, self._start_game_timer)
 
     def _handle_game_over(self):

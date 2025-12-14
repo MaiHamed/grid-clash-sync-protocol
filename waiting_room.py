@@ -1,8 +1,9 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, BooleanVar
 import subprocess
 import sys
 import threading
+import os
 import socket
 
 MAX_PLAYERS = 4
@@ -10,10 +11,11 @@ MIN_PLAYERS = 2
 WAITING_ROOM_PORT = 5006 
 
 _waiting_room_instance = None
+GAME_SETTINGS = {"stealing_enabled": False}  # Default to no stealing
 
 class WaitingRoom:
     def __init__(self):
-        global _waiting_room_instance
+        global _waiting_room_instance, GAME_SETTINGS
         
         if _waiting_room_instance is not None:
             try:
@@ -29,7 +31,7 @@ class WaitingRoom:
         
         self.root = tk.Tk()
         self.root.title("🎮 Grid Game Waiting Room")
-        self.root.geometry("500x450")
+        self.root.geometry("550x600")  # Increased height for settings
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         _waiting_room_instance = self
@@ -39,6 +41,10 @@ class WaitingRoom:
         self.game_started = False
         self.waiting_timer = 60
         self.timer_running = False
+        
+        # Game settings
+        self.stealing_enabled = tk.BooleanVar(value=False)
+        GAME_SETTINGS["stealing_enabled"] = False  # Reset global setting
 
         self.setup_ui()
         self.add_player()
@@ -110,6 +116,25 @@ class WaitingRoom:
 
         ttk.Label(main_frame, text="🎮 Grid Game Waiting Room", font=("Arial", 18, "bold")).pack(pady=10)
 
+        # Game Settings Frame
+        settings_frame = ttk.LabelFrame(main_frame, text="Game Settings", padding=10)
+        settings_frame.pack(fill=tk.X, pady=10)
+        
+        # Stealing mode checkbox
+        self.stealing_checkbox = ttk.Checkbutton(
+            settings_frame, 
+            text="Enable Stealing Mode", 
+            variable=self.stealing_enabled,
+            command=self.update_game_settings
+        )
+        self.stealing_checkbox.pack(anchor="w", pady=5)
+        
+        # Game mode description
+        self.mode_desc = tk.Text(settings_frame, height=5, font=("Arial", 9), bg="#f0f0f0", wrap="word")
+        self.mode_desc.pack(fill=tk.X, pady=5)
+        self.update_mode_description()
+        self.mode_desc.config(state="disabled")
+    
         players_frame = ttk.LabelFrame(main_frame, text="Players in Room", padding=10)
         players_frame.pack(fill=tk.X, pady=10)
         self.players_text = tk.Text(players_frame, height=6, font=("Consolas", 10), bg="#f8f9fa")
@@ -132,7 +157,35 @@ class WaitingRoom:
 
         self.player_count_label = ttk.Label(main_frame, text=f"Players: {len(self.players)}/{MAX_PLAYERS}")
         self.player_count_label.pack(pady=5)
+        
+        # Current game mode indicator
+        self.mode_label = ttk.Label(main_frame, text="Mode: Stealing Disabled", font=("Arial", 10, "italic"))
+        self.mode_label.pack(pady=5)
 
+    def update_game_settings(self):
+        """Update game settings when checkbox is toggled"""
+        global GAME_SETTINGS
+        GAME_SETTINGS["stealing_enabled"] = self.stealing_enabled.get()
+        
+        mode_text = "Mode: Stealing Enabled" if GAME_SETTINGS["stealing_enabled"] else "Mode: Stealing Disabled"
+        self.mode_label.config(text=mode_text)
+        self.update_mode_description()
+        
+        print(f"[SETTINGS] Stealing mode: {GAME_SETTINGS['stealing_enabled']}")
+
+    def update_mode_description(self):
+        """Update the game mode description based on stealing setting"""
+        self.mode_desc.config(state="normal")
+        self.mode_desc.delete(1.0, tk.END)
+        
+        if self.stealing_enabled.get():
+            desc = "STEALING MODE:\n• Players can steal already-claimed cells from others\n• Game has a 60-second timer\n• Winner is player with most cells when time runs out"
+        else:
+            desc = "NON-STEALING MODE:\n• Cells can only be claimed when empty\n• NO TIME LIMIT\n• Game ends when ALL cells are claimed\n• Winner is player with most cells"
+        
+        self.mode_desc.insert("1.0", desc)
+        self.mode_desc.config(state="disabled")
+    
     def add_player(self):
         """Add a new player internally (no new window)"""
         if len(self.players) >= MAX_PLAYERS:
@@ -192,15 +245,31 @@ class WaitingRoom:
         self.timer_label.config(text="Starting game...")
         self.start_button.config(state="disabled")
         self.more_players_btn.config(state="disabled")
+        
+        # Save settings to a file or pass to clients
+        self.save_game_settings()
 
         for pid in self.players:
             threading.Thread(target=self.launch_client, args=(pid,), daemon=True).start()
 
         self.root.after(1000, self.root.destroy)  
 
+    def save_game_settings(self):
+        """Save game settings to a file that server/clients can read"""
+        try:
+            with open("game_settings.txt", "w") as f:
+                f.write(f"stealing_enabled={self.stealing_enabled.get()}")
+            print(f"[SETTINGS] Saved to file: stealing_enabled={self.stealing_enabled.get()}")
+        except Exception as e:
+            print(f"[SETTINGS] Error saving settings: {e}")
+
     def launch_client(self, pid):
         try:
-            subprocess.Popen([sys.executable, "client.py"])
+            # Pass settings to client via command line or environment
+            env = os.environ.copy()
+            env["STEALING_ENABLED"] = "1" if self.stealing_enabled.get() else "0"
+            
+            subprocess.Popen([sys.executable, "client.py"], env=env)
         except Exception as e:
             print(f"Failed to launch client {pid}: {e}")
 
@@ -210,10 +279,11 @@ class WaitingRoom:
             self.root.after(2000, self.update_ui_loop)
 
     def on_closing(self):
-        global _waiting_room_instance
+        global _waiting_room_instance, GAME_SETTINGS
         
         if _waiting_room_instance == self:
             _waiting_room_instance = None
+            GAME_SETTINGS["stealing_enabled"] = False  # Reset
         
         self.root.destroy()
 
